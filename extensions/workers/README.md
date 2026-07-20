@@ -1,0 +1,89 @@
+# Pi Workers extension
+
+Persistent, nested Pi workers with **strict, user-owned per-model routing**.
+Install the parent package with `pi install .` (or `pi install -l .`), then configure each project that will run workers.
+
+## Configure routing
+
+Create `.pi/workers.json` in the target project, starting with [`../../examples/workers.json.example`](../../examples/workers.json.example):
+
+```json
+{
+  "maxDepth": 3,
+  "maxWorkers": 12,
+  "models": {
+    "openai/gpt-5.4": {
+      "workers": {
+        "research": {
+          "model": "anthropic/claude-haiku-4-5",
+          "maxPerLineage": 1
+        },
+        "implementation": {
+          "model": "anthropic/claude-sonnet-4-5",
+          "maxPerLineage": 1
+        }
+      }
+    },
+    "anthropic/claude-sonnet-4-5": {
+      "workers": {
+        "research": {
+          "model": "anthropic/claude-haiku-4-5",
+          "maxPerLineage": 1
+        }
+      }
+    }
+  }
+}
+```
+
+Every key is an exact Pi `provider/model` string. A tag belongs to its active caller model:
+
+```text
+models[active caller model].workers[tag] -> target worker model
+```
+
+Thus `openai/gpt-5.4#research` and `anthropic/claude-sonnet-4-5#research` are independent routes. No prompt, extension, fallback, wildcard, or `workers_spawn` argument can select a worker model: models absent from `models` cannot spawn workers.
+
+## Strict limits and lifecycle
+
+- `maxDepth` is a hard root-to-leaf ceiling.
+- `maxWorkers` caps the entire runtime, including nested workers.
+- `maxPerLineage` defaults to one and is checked against the full `caller-model#tag` route, preventing unbounded direct or indirect recursion.
+- Each child receives an immutable serialized policy snapshot. Editing `.pi/workers.json` cannot widen a live tree.
+- A guest worker cannot switch away from its policy-selected model; an attempted change is restored and recorded.
+
+Workers are ordinary persisted Pi sessions, with normal project/global extensions enabled. Treat every extension enabled in the worker's project/user configuration as trusted code.
+
+## Agent tools
+
+- `workers_spawn({ tag, task, name?, wait? })` starts a policy-authorized worker.
+- `workers_query({ workerId, tail? })` reads a worker's durable Pi transcript; use `workerId: "all"` for the tree.
+- `workers_listen({ workerId, since?, limit? })` reads retained live Pi and guest events and returns `nextCursor`.
+- `workers_steer({ workerId, message, delivery? })` sends a `steer` instruction after the current tool batch or a `followUp` after it settles.
+
+The root, any parent, and the user can query, listen to, steer, and abort nested workers by id. Use `/workers` for the equivalent interactive interface:
+
+```text
+/workers status [worker-id|all]
+/workers query <worker-id>
+/workers listen <worker-id> [cursor]
+/workers spawn <tag> <task>
+/workers steer <worker-id> <message>
+/workers abort <worker-id>
+```
+
+## Transcripts and guest events
+
+Worker transcripts are normal persisted Pi sessions; `workers_query` reads those JSONL records rather than a lossy final-answer cache. `workers_listen` also multiplexes Pi RPC events and values published by code in the worker process:
+
+```ts
+globalThis.PI_WORKERS_EVENTS.set("build-progress", { completed: 4, total: 10 });
+```
+
+The Symbol form, `Symbol.for("pi.workers.events")`, is also available. Values are JSON-sanitized and limited to 64 KiB; never publish secrets.
+
+Transient control/status/event indexes are removed when the root session exits. Worker transcripts remain in Pi's normal session store.
+
+## Dynamic code-driven workers
+
+Dynamic code-driven spawning is deliberately deferred. See [DYNAMIC_WORKERS.md](DYNAMIC_WORKERS.md): any future path must reduce to the same caller-relative `{ tag, task, name? }` request and retain the unchanged authorization and recursion checks.

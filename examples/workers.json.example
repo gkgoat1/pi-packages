@@ -1,0 +1,17 @@
+{
+  "maxDepth": 3,
+  "maxWorkers": 12,
+  "models": {
+    "openai/gpt-5.4": {
+      "workers": {
+        "research": { "model": "anthropic/claude-haiku-4-5", "maxPerLineage": 1 },
+        "implementation": { "model": "anthropic/claude-sonnet-4-5", "maxPerLineage": 1 }
+      }
+    },
+    "anthropic/claude-sonnet-4-5": {
+      "workers": {
+        "research": { "model": "anthropic/claude-haiku-4-5", "maxPerLineage": 1 }
+      }
+    }
+  }
+}

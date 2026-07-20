@@ -1,0 +1,32 @@
+{
+  "name": "pi-packages",
+  "version": "0.1.0",
+  "description": "Pi extensions for file guards, routed workers, and configurable MCP clients",
+  "keywords": ["pi-package", "pi", "mcp", "workers", "file-guard"],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "check": "npx --yes --package typescript tsc --noEmit -p tsconfig.mcp.json",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "typescript": "^5.7.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/file-guard",
+      "./extensions/mcp-client",
+      "./extensions/workers"
+    ]
+  }
+}

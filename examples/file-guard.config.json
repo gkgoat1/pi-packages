@@ -1,0 +1,14 @@
+{
+	"enabled": true,
+	"globalIncludeFiles": ["~/.piinclude"],
+	"globalModelIncludeFiles": {
+		"anthropic/claude-sonnet-4-20250514": ["~/.piinclude.claude"]
+	},
+	"projectIncludeFiles": [".piinclude", ".piinclude.shared"],
+	"projectModelIncludeFiles": {
+		"anthropic/claude-sonnet-4-20250514": [".piinclude.claude"],
+		"openai/gpt-4o": [".piinclude.openai"]
+	},
+	"defaultPolicy": "prompt",
+	"wrapAllTools": true
+}
