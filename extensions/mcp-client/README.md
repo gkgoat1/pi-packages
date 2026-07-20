@@ -8,7 +8,7 @@ The primary preset is [SylphxAI/pdf-reader-mcp](https://github.com/SylphxAI/pdf-
 
 ## Configuration precedence
 
-Configuration is layered in this order; later values override earlier values:
+Configuration is layered in this order; later values override earlier values. The client is **disabled by default**: set top-level `"enabled": true` in one of these sources (or set it via `PI_MCP_CLIENT_CONFIG`) before any MCP server is started:
 
 1. `~/.pi/agent/mcp-client.json`
 2. `.pi/mcp-client.json` in a **trusted** project
@@ -18,6 +18,7 @@ The project file is ignored until Pi trusts the project. Each server is merged b
 
 ```json
 {
+  "enabled": true,
   "prompt": {
     "override": "Optional replacement for the default MCP safety guidance.",
     "append": "Instructions appended for every exposed MCP server.",
@@ -47,7 +48,7 @@ The project file is ignored until Pi trusts the project. Each server is merged b
 }
 ```
 
-`tools.enabled` is an allowlist. Omit it to make all discovered tools eligible; `tools.disabled` always wins. A server with `enabled: false` is not started.
+`tools.enabled` is an allowlist. Omit it to make all discovered tools eligible; `tools.disabled` always wins. A server with `enabled: false` is not started. The client itself starts only when top-level `enabled` is `true`.
 
 ## Environment controls
 
@@ -55,17 +56,17 @@ Environment settings intentionally provide both coarse and granular deployment c
 
 | Variable | Meaning |
 | --- | --- |
-| `PI_MCP_CLIENT_CONFIG` | JSON configuration object, layered after files. |
+| `PI_MCP_CLIENT_CONFIG` | JSON configuration object, layered after files; set `{"enabled":true}` to activate the client. |
 | `PI_MCP_CLIENT_ENABLED_TOOLS` | Comma-separated global allowlist: `server/tool` or `server/*`. When set, only listed tools can load. |
 | `PI_MCP_CLIENT_DISABLED_TOOLS` | Comma-separated denylist: `server/tool` or `server/*`; always wins. |
 | `PI_MCP_CLIENT_PROMPT` | Replaces the generic MCP safety prompt. |
 | `PI_MCP_CLIENT_PROMPT_APPEND` | Appends generic MCP instructions. |
 | `PI_MCP_CLIENT_TOOL_PROMPTS` | JSON string map of `server/tool` to tool-specific instructions. |
 
-For example, expose only `read_pdf` and `pdf_evidence` without editing configuration:
+For example, enable the client and expose only `read_pdf` and `pdf_evidence` without editing configuration:
 
 ```bash
-PI_MCP_CLIENT_ENABLED_TOOLS='pdf-reader/read_pdf,pdf-reader/pdf_evidence' pi
+PI_MCP_CLIENT_CONFIG='{"enabled":true}' PI_MCP_CLIENT_ENABLED_TOOLS='pdf-reader/read_pdf,pdf-reader/pdf_evidence' pi
 ```
 
 Run `/mcp-client` to show which servers connected and the exact Pi tool names. Registered names are deterministic: `mcp_<server>_<tool>` (for example `mcp_pdf_reader_read_pdf`). If normalization or the 64-character name limit produces a collision, a deterministic numeric suffix is added; `/mcp-client` always shows the actual registered name.

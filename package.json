@@ -1,8 +1,8 @@
 {
   "name": "pi-packages",
   "version": "0.1.0",
-  "description": "Pi extensions for file guards, routed workers, and configurable MCP clients",
-  "keywords": ["pi-package", "pi", "mcp", "workers", "file-guard"],
+  "description": "Pi extensions for file guards, routed workers, configurable MCP clients, and thinking compression",
+  "keywords": ["pi-package", "pi", "mcp", "workers", "file-guard", "thinking-compression"],
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -10,11 +10,12 @@
   },
   "scripts": {
     "check": "npx --yes --package typescript tsc --noEmit -p tsconfig.mcp.json",
-    "test": "node --test"
+    "test": "node --import tsx --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "tsx": "^4.19.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -26,7 +27,8 @@
     "extensions": [
       "./extensions/file-guard",
       "./extensions/mcp-client",
-      "./extensions/workers"
+      "./extensions/workers",
+      "./extensions/thinking-compression"
     ]
   }
 }

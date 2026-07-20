@@ -37,6 +37,8 @@ interface ServerConfig {
 }
 
 interface McpConfig {
+	/** Explicit opt-in: installed package extensions start disabled. */
+	enabled?: boolean;
 	servers?: Record<string, ServerConfig>;
 	prompt?: PromptConfig;
 }
@@ -103,7 +105,11 @@ function parseToolPolicy(value: unknown): ToolPolicy | undefined {
 function parseConfig(value: unknown): McpConfig {
 	const object = asObject(value);
 	if (!object) return {};
-	const config: McpConfig = { prompt: parsePrompt(object.prompt), servers: {} };
+	const config: McpConfig = {
+		enabled: typeof object.enabled === "boolean" ? object.enabled : undefined,
+		prompt: parsePrompt(object.prompt),
+		servers: {},
+	};
 	const servers = asObject(object.servers);
 	if (!servers) return config;
 	for (const [name, rawServer] of Object.entries(servers)) {
@@ -147,7 +153,11 @@ function mergeConfig(base: McpConfig, next: McpConfig): McpConfig {
 			prompt: mergePrompt(previous?.prompt, server.prompt),
 		};
 	}
-	return { servers, prompt: mergePrompt(base.prompt, next.prompt) };
+	return {
+		enabled: next.enabled ?? base.enabled,
+		servers,
+		prompt: mergePrompt(base.prompt, next.prompt),
+	};
 }
 
 function readConfig(path: string): McpConfig {
@@ -271,6 +281,7 @@ export default function mcpClientExtension(pi: ExtensionAPI) {
 		started = true;
 		startupError = undefined;
 		loadConfig(ctx.cwd, ctx.isProjectTrusted());
+		if (config.enabled !== true) return;
 		const enabled = csv(process.env.PI_MCP_CLIENT_ENABLED_TOOLS);
 		const disabled = csv(process.env.PI_MCP_CLIENT_DISABLED_TOOLS);
 		const claimedNames = new Set<string>(toolNames.values());
@@ -347,7 +358,12 @@ export default function mcpClientExtension(pi: ExtensionAPI) {
 			const lines = [...connected.values()].map((server) => server.error
 				? `${server.name}: error — ${server.error}`
 				: `${server.name}: ${server.tools.length ? server.tools.map((tool) => `${tool.name} → ${toolNames.get(toolKey(server.name, tool.name)) ?? piToolName(server.name, tool.name)}`).join(", ") : "no enabled tools"}`);
-			ctx.ui.notify(lines.join("\n") || startupError || "No MCP servers are configured.", lines.some((line) => line.includes(": error")) ? "warning" : "info");
+			ctx.ui.notify(
+			config.enabled === true
+				? lines.join("\n") || startupError || "No MCP servers are configured."
+				: "MCP Client is disabled. Set \"enabled\": true in mcp-client.json or PI_MCP_CLIENT_CONFIG to enable it.",
+			lines.some((line) => line.includes(": error")) ? "warning" : "info",
+		);
 		},
 	});
 }

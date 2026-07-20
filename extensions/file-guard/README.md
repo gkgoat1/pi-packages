@@ -7,7 +7,7 @@ File Guard has two **composable modes**:
 - **Guard mode** (the original behaviour) — intercepts reads, writes, edits, bash, grep, find, and ls when they target paths not listed in `.piinclude`, batches permission requests, and prompts the user. Non-blocking prompts return `[File Guard pending]`; the real result arrives as a steering message once approved.
 - **View mode** — surfaces critical tool moments as durable timeline entries with context (path, line count, bash command, etc). Works on its own, or stacked on top of guard mode. When stacked, guard decisions (pending / allowed / blocked) are logged alongside the same context, making it easier to decide whether to approve an action.
 
-Both modes can be toggled independently via config or environment variables.
+Both modes are disabled by default. Explicitly enable one or both via config or environment variables.
 
 ## Key behaviour
 
@@ -27,8 +27,8 @@ Both modes can be toggled independently via config or environment variables.
 
 | Variable | Values | Effect |
 |----------|--------|--------|
-| `PI_FILE_GUARD_ENABLED` | `true`/`1` or `false`/`0` | Enable or disable guard mode. |
-| `PI_FILE_GUARD_VIEW` | `true`/`1` or `false`/`0` | Enable or disable view mode. |
+| `PI_FILE_GUARD_ENABLED` | `true`/`1` or `false`/`0` | Enable or disable guard mode (disabled by default). |
+| `PI_FILE_GUARD_VIEW` | `true`/`1` or `false`/`0` | Enable or disable view mode (disabled by default). |
 | `PI_FILE_GUARD_MODES` | comma-separated, e.g. `guard,view` | Set both modes at once. |
 | `PI_FILE_GUARD_ENRICH` | `true`/`1` or `false`/`0` | Enable deterministic (and optional model) enrichment for view mode and guard prompts. |
 | `PI_FILE_GUARD_ENRICH_MODEL` | e.g. `anthropic/claude-haiku-4-5` | Optional model for enrichment. Sets `useModel: true`. |

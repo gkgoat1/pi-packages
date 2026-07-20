@@ -5,10 +5,11 @@ Install the parent package with `pi install .` (or `pi install -l .`), then conf
 
 ## Configure routing
 
-Create `.pi/workers.json` in the target project, starting with [`../../examples/workers.json.example`](../../examples/workers.json.example):
+Create `.pi/workers.json` in the target project, starting with [`../../examples/workers.json.example`](../../examples/workers.json.example). Workers are **disabled by default**; change its top-level `"enabled"` value to `true` only in projects that should be allowed to create workers:
 
 ```json
 {
+  "enabled": true,
   "maxDepth": 3,
   "maxWorkers": 12,
   "models": {

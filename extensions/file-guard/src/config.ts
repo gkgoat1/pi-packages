@@ -29,8 +29,8 @@ function defaultEnrichment(): ViewEnrichmentConfig {
 }
 
 const DEFAULT_CONFIG: FileGuardConfig = {
-	enabled: true,
-	guardEnabled: true,
+	enabled: false,
+	guardEnabled: false,
 	viewMode: false,
 	globalIncludeFiles: [path.join(os.homedir(), ".piinclude")],
 	globalModelIncludeFiles: {},
