@@ -19,6 +19,13 @@
  * `.pi/gondolin.json` (trusted projects), or `PI_GONDOLIN_ENABLED=true`.
  * Requires QEMU (`brew install qemu` on macOS); the guest image (~200 MB) is
  * downloaded into `~/.cache/gondolin/` on first run.
+ *
+ * The running VM is also published as a symbol-keyed global handle
+ * (`Symbol.for("pi-packages.gondolin.shared")`, see src/shared.ts) so the
+ * other extensions in this package can reuse it without depending on this
+ * bundle: File Guard enforces its policy as VM-filesystem interception, and
+ * the MCP client launches servers inside the VM. Both integrations activate
+ * only when this extension and the consumer are enabled.
  */
 
 import path from "node:path";
@@ -29,10 +36,19 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { RealFSProvider, VM, createHttpHooks } from "@earendil-works/gondolin";
+import { VM, createHttpHooks } from "@earendil-works/gondolin";
 import { loadConfig, type GondolinConfig } from "./src/config.ts";
 import { buildSecretDefinitions, buildStubEnv, discoverSecrets, type DiscoveredSecret } from "./src/secrets.ts";
 import { GUEST_BASE_ENV, createGondolinBashOps, createGondolinEditOps, createGondolinReadOps, createGondolinWriteOps } from "./src/ops.ts";
+import {
+	createGuardedWorkspaceProvider,
+	hostPathToGuestPath,
+	installGondolinShared,
+	launchGuestProcess,
+	RealFSProvider,
+	type GondolinFsGuard,
+	type GondolinShared,
+} from "./src/shared.ts";
 
 interface VmState {
 	vm: VM | null;
@@ -43,6 +59,7 @@ interface VmState {
 
 export default function gondolinExtension(pi: ExtensionAPI) {
 	const localCwd = process.cwd();
+	const fsGuards = new Set<GondolinFsGuard>();
 
 	// Baseline local tools (definitions + renderers reused; execution overridden)
 	const localRead = createReadTool(localCwd);
@@ -54,6 +71,42 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 	const state: VmState = { vm: null, starting: null, error: undefined, secrets: [] };
 	// Project trust is resolved before session_start; capture it for config reloads.
 	const trustedRef = { value: false };
+
+	// -------------------------------------------------------------------------
+	// Shared handle — other extensions in this package reuse the VM through a
+	// symbol-keyed global instead of a dependency (see src/shared.ts).
+	// -------------------------------------------------------------------------
+
+	const shared: GondolinShared = {
+		version: 1,
+		get hostCwd() {
+			return localCwd;
+		},
+		get guestWorkspace() {
+			return config.guestWorkspace;
+		},
+		isEnabled: () => config.enabled,
+		refreshTrust: (isProjectTrusted) => {
+			trustedRef.value = isProjectTrusted;
+			config = loadConfig({ cwd: localCwd, isProjectTrusted: () => trustedRef.value });
+			return config.enabled;
+		},
+		ensureVm: () => ensureVm(),
+		getVm: () => state.vm,
+		toGuestPath: (hostPath) => hostPathToGuestPath(localCwd, config.guestWorkspace, hostPath),
+		registerFsGuard: (guard) => {
+			fsGuards.add(guard);
+			return () => {
+				fsGuards.delete(guard);
+			};
+		},
+		execGuest: (spec) => {
+			const vm = state.vm;
+			if (!vm) throw new Error("Gondolin VM is not running; await ensureVm() before execGuest()");
+			return launchGuestProcess(vm, spec, state.secrets, config.guestWorkspace);
+		},
+	};
+	installGondolinShared(shared);
 
 	function statusLine(ctx: ExtensionContext, text: string, tone: "accent" | "muted" = "accent"): void {
 		ctx.ui.setStatus("gondolin", ctx.ui.theme.fg(tone, `Gondolin: ${text}`));
@@ -93,8 +146,16 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 					...(config.image ? { imagePath: config.image } : {}),
 				},
 				vfs: {
+					// The host workspace is mounted through a guardable provider so
+					// other extensions (File Guard) can enforce policy at the VM
+					// filesystem layer instead of restricting the tools themselves.
 					mounts: {
-						[guestWorkspace]: new RealFSProvider(localCwd),
+						[guestWorkspace]: createGuardedWorkspaceProvider(
+							new RealFSProvider(localCwd),
+							fsGuards,
+							localCwd,
+							guestWorkspace,
+						),
 					},
 				},
 				sessionLabel: `pi-gondolin:${path.basename(localCwd)}`,
@@ -255,6 +316,7 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 				`vm: ${state.vm ? "running" : state.starting ? "starting" : state.error ? `failed — ${state.error}` : "not started"}`,
 				`accel: ${config.accel} (QEMU; "tcg" = software emulation, nested-VM safe)`,
 				`mount: ${localCwd} → ${config.guestWorkspace}`,
+				`shared handle: published (fs guards: ${fsGuards.size})`,
 			];
 			if (config.httpProxy.enabled) {
 				const allowedHosts = config.allowedHosts

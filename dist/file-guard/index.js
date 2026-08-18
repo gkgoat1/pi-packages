@@ -1343,6 +1343,82 @@ function wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, loc
   };
 }
 
+// extensions/file-guard/src/gondolin.ts
+import { relative as relative2 } from "node:path";
+var GONDOLIN_SHARED_KEY = /* @__PURE__ */ Symbol.for("pi-packages.gondolin.shared");
+function getGondolinHandle() {
+  const value = globalThis[GONDOLIN_SHARED_KEY];
+  if (typeof value !== "object" || value === null) return void 0;
+  const handle = value;
+  return handle.version === 1 ? handle : void 0;
+}
+var VM_TOOLS = ["read", "write", "edit", "bash"];
+function isVmTool(toolName) {
+  return VM_TOOLS.includes(toolName);
+}
+function createVmFsGuard(deps) {
+  const ctxLike = { cwd: deps.cwd };
+  const paramsFor = (request) => ({
+    op: request.op,
+    path: request.guestPath,
+    write: request.write
+  });
+  return {
+    async before(request) {
+      const relPath = relative2(deps.cwd, request.hostPath);
+      const relInside = relPath !== "" && !relPath.startsWith("..") && !relPath.includes(":");
+      const allowed = deps.isAllowed(request.hostPath) || relInside && deps.isAllowed(relPath);
+      if (allowed) return void 0;
+      let reason;
+      let status;
+      if (deps.isDenied(request.hostPath) || relInside && deps.isDenied(relPath)) {
+        reason = `${request.hostPath} was previously denied`;
+        status = "blocked";
+      } else if (!deps.hasUI) {
+        if (deps.defaultPolicy === "allow") return void 0;
+        reason = `no UI available to confirm ${request.op} on ${request.hostPath}`;
+        status = "blocked";
+      } else {
+        const description = `${request.op} ${request.guestPath}${request.write ? " (write)" : ""}`;
+        const approved = await deps.prompt("vm-fs", description, [request.hostPath]);
+        if (approved) {
+          deps.view?.logGuard(
+            `vm-fs:${request.op}`,
+            void 0,
+            "allowed",
+            paramsFor(request),
+            ctxLike,
+            "user allowed via prompt"
+          );
+          return void 0;
+        }
+        reason = `user denied ${request.hostPath}`;
+        status = "user-denied";
+      }
+      deps.view?.logGuard(`vm-fs:${request.op}`, void 0, status, paramsFor(request), ctxLike, reason);
+      deps.notify?.(
+        `File Guard blocked ${request.op} ${request.guestPath} in the sandbox VM: ${reason}`,
+        "warning"
+      );
+      return { reason };
+    },
+    async after(request) {
+      if (!deps.view || !request.write) return;
+      deps.view.logGuard(
+        `vm-fs:${request.op}`,
+        void 0,
+        "auto-allowed",
+        paramsFor(request),
+        ctxLike,
+        "sandbox VM filesystem"
+      );
+    }
+  };
+}
+function isInterceptionActive(gondolinEnabled, guardEnabled) {
+  return gondolinEnabled && guardEnabled;
+}
+
 // extensions/file-guard/src/includes.ts
 import * as fs5 from "node:fs";
 import * as path4 from "node:path";
@@ -1724,6 +1800,10 @@ function fileGuardExtension(pi) {
   let viewLogger;
   let enricher;
   let currentModel;
+  let gondolinHandle;
+  let gondolinVmActive = false;
+  let interception = false;
+  let unregisterVmGuard;
   const pendingToolDefs = [];
   const wrappedToolNames = /* @__PURE__ */ new Set();
   const originalRegisterTool = pi.registerTool.bind(pi);
@@ -1733,6 +1813,7 @@ function fileGuardExtension(pi) {
   function maybeWrapTool(toolDef) {
     if (!anyModeActive() || !config.wrapAllTools || !allowedSet || !promptQueue || !viewLogger) return toolDef;
     if (!toolDef?.name) return toolDef;
+    if (gondolinVmActive && isVmTool(toolDef.name)) return toolDef;
     wrappedToolNames.add(toolDef.name);
     return wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, toolDef);
   }
@@ -1798,6 +1879,7 @@ function fileGuardExtension(pi) {
       currentModel = ctx.model;
       reloadIncludes(ctx.model);
     }
+    if (gondolinVmActive && isVmTool(event.toolName)) return void 0;
     if (OVERRIDDEN_TOOLS.includes(event.toolName) || wrappedToolNames.has(event.toolName)) return void 0;
     if (!config.guardEnabled) return void 0;
     const guardInfo = extractToolPaths(event.toolName, event.input, ctx.cwd);
@@ -1844,29 +1926,47 @@ function fileGuardExtension(pi) {
     reinitialize(ctx);
     currentModel = ctx.model;
     reloadIncludes(ctx.model);
+    gondolinHandle = getGondolinHandle();
+    gondolinVmActive = gondolinHandle ? gondolinHandle.refreshTrust(ctx.isProjectTrusted()) : false;
+    interception = isInterceptionActive(gondolinVmActive, config.guardEnabled);
+    if (gondolinHandle && gondolinVmActive && (config.guardEnabled || config.viewMode) && allowedSet && promptQueue) {
+      const guard = createVmFsGuard({
+        cwd: ctx.cwd,
+        isAllowed: (p) => allowedSet.isAllowed(p),
+        isDenied: (p) => allowedSet.isDenied(p),
+        prompt: (toolName, description, paths, contextSummary) => promptQueue.request(toolName, description, paths, contextSummary),
+        ...viewLogger ? { view: viewLogger } : {},
+        ...ctx.hasUI ? { notify: (message, level) => ctx.ui.notify(message, level) } : {},
+        hasUI: ctx.hasUI,
+        defaultPolicy: config.defaultPolicy
+      });
+      unregisterVmGuard?.();
+      unregisterVmGuard = gondolinHandle.registerFsGuard(guard);
+    }
     for (const toolDef of pendingToolDefs.splice(0)) {
       originalRegisterTool(maybeWrapTool(toolDef));
     }
     if (!anyModeActive()) return;
     if (config.guardEnabled || config.viewMode) {
-      const localRead = createReadTool(ctx.cwd);
-      const localWrite = createWriteTool(ctx.cwd);
-      const localEdit = createEditTool(ctx.cwd);
-      const localBash = createBashTool(ctx.cwd);
       const localGrep = createGrepTool(ctx.cwd);
       const localFind = createFindTool(ctx.cwd);
       const localLs = createLsTool(ctx.cwd);
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localRead));
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localWrite));
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localEdit));
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localBash));
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localGrep));
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localFind));
-      originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, localLs));
+      const hostTools = gondolinVmActive ? [localGrep, localFind, localLs] : [
+        createReadTool(ctx.cwd),
+        createWriteTool(ctx.cwd),
+        createEditTool(ctx.cwd),
+        createBashTool(ctx.cwd),
+        localGrep,
+        localFind,
+        localLs
+      ];
+      for (const tool of hostTools) {
+        originalRegisterTool(wrapTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, tool));
+      }
     }
     if (ctx.hasUI) {
       const parts = [];
-      if (config.guardEnabled) parts.push("guard");
+      if (config.guardEnabled) parts.push(interception ? "guard (VM interception)" : "guard");
       if (config.viewMode) parts.push("view");
       if (parts.length > 0) {
         ctx.ui.notify(`File Guard active (${parts.join(" + ")}) \u2014 use \`/file-guard\` to inspect.`, "info");
@@ -1892,7 +1992,11 @@ ${lines.slice(2, 4).join("\n")}`, "info");
       reloadIncludes(ctx.model);
       if (!allowedSet) return;
       const compressed = compressAllowedPaths(allowedSet, ctx.cwd);
-      const lines = [...formatStatusLines(ctx.model), `Allowed paths: ${compressed || "(none)"}`];
+      const lines = [
+        ...formatStatusLines(ctx.model),
+        `Gondolin interception: ${interception ? "active (policy enforced at the VM filesystem layer)" : gondolinHandle ? "inactive (Gondolin " + (gondolinVmActive ? "enabled but guard mode off" : "disabled") + ")" : "not installed"}`,
+        `Allowed paths: ${compressed || "(none)"}`
+      ];
       ctx.ui.notify(lines.join("\n"), "info");
     }
   });
@@ -1906,25 +2010,34 @@ ${lines.slice(2, 4).join("\n")}`, "info");
     const lines = [];
     lines.push("## File Guard");
     if (config.guardEnabled) {
-      lines.push(
-        "The agent may only access files listed in configured `.piinclude` files and paths the user has explicitly allowed during this session."
-      );
-      lines.push(
-        "Model-specific include files may override base includes per tier when configured in `.pi/file-guard.json`."
-      );
-      lines.push("");
-      lines.push(
-        "Tool results may be deferred while the user reviews file access. A result starting with `[File Guard pending]` is a placeholder."
-      );
-      lines.push(
-        "The real result or a block notice will arrive as a user message starting with `[File Guard result for tool call <id>]` or `[File Guard blocked tool call <id>]`."
-      );
-      lines.push("Treat that follow-up message as the result for the matching tool call; do not act on the pending placeholder.");
+      if (interception) {
+        lines.push(
+          "Filesystem access is enforced inside the sandbox VM: operations on paths outside the allowed set fail with `EACCES` (Permission denied)."
+        );
+        lines.push(
+          "The user may be prompted when a tool touches a path outside the allowed set; granted access persists for the session. Denied paths fail immediately."
+        );
+      } else {
+        lines.push(
+          "The agent may only access files listed in configured `.piinclude` files and paths the user has explicitly allowed during this session."
+        );
+        lines.push(
+          "Model-specific include files may override base includes per tier when configured in `.pi/file-guard.json`."
+        );
+        lines.push("");
+        lines.push(
+          "Tool results may be deferred while the user reviews file access. A result starting with `[File Guard pending]` is a placeholder."
+        );
+        lines.push(
+          "The real result or a block notice will arrive as a user message starting with `[File Guard result for tool call <id>]` or `[File Guard blocked tool call <id>]`."
+        );
+        lines.push("Treat that follow-up message as the result for the matching tool call; do not act on the pending placeholder.");
+      }
     }
     if (config.viewMode) {
       if (config.guardEnabled) lines.push("");
       lines.push(
-        "File Guard view mode is active: reads, writes, edits, bash, grep, find, and ls operations are logged as timeline entries with extracted context."
+        interception ? "File Guard view mode is active: mutating filesystem operations inside the sandbox VM and host-side search tools are logged as timeline entries." : "File Guard view mode is active: reads, writes, edits, bash, grep, find, and ls operations are logged as timeline entries with extracted context."
       );
     }
     if (compressed) {
@@ -1941,6 +2054,8 @@ ${lines.join("\n")}` };
   });
   pi.on("session_shutdown", async () => {
     persist();
+    unregisterVmGuard?.();
+    unregisterVmGuard = void 0;
   });
 }
 export {

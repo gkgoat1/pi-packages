@@ -16,6 +16,22 @@ import {
 } from "../src/secrets.ts";
 import type { RandomSource } from "../src/secrets.ts";
 import { GUEST_BASE_ENV, buildGuestEnv, toGuestPath } from "../src/ops.ts";
+import type { VM } from "@earendil-works/gondolin";
+import {
+	clearGondolinSharedForTest,
+	createGuardedWorkspaceProvider,
+	getGondolinShared,
+	GONDOLIN_SHARED_KEY,
+	hostPathToGuestPath,
+	installGondolinShared,
+	isWriteFsOp,
+	launchGuestProcess,
+	stubifyEnv,
+	toHostPath,
+	type FsGuardRequest,
+	type GondolinFsGuard,
+} from "../src/shared.ts";
+import { MemoryProvider } from "@earendil-works/gondolin";
 import { createHttpHooks } from "@earendil-works/gondolin";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -301,4 +317,164 @@ test("gondolin extension leaves tools local while disabled", async () => {
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+// ---------------------------------------------------------------------------
+// Shared handle (symbol-keyed global reused by other extensions)
+// ---------------------------------------------------------------------------
+
+test("gondolin shared handle installs and reads via the registered symbol", () => {
+	const handle: import("../src/shared.ts").GondolinShared = {
+		version: 1,
+		hostCwd: "/host",
+		guestWorkspace: "/workspace",
+		isEnabled: () => true,
+		refreshTrust: () => true,
+		ensureVm: async () => null,
+		getVm: () => null,
+		toGuestPath: (p) => p,
+		registerFsGuard: () => () => {},
+		execGuest: () => {
+			throw new Error("not under test");
+		},
+	};
+	installGondolinShared(handle);
+	try {
+		assert.equal(getGondolinShared(), handle);
+		// Wrong contract versions are rejected.
+		(globalThis as Record<symbol, unknown>)[GONDOLIN_SHARED_KEY] = { ...handle, version: 2 as unknown as 1 };
+		assert.equal(getGondolinShared(), undefined);
+	} finally {
+		clearGondolinSharedForTest();
+	}
+	assert.equal(getGondolinShared(), undefined);
+});
+
+test("gondolin shared path mapping converts host and guest paths", () => {
+	assert.equal(toHostPath("/host/proj", "/workspace", "/src/a.ts"), "/host/proj/src/a.ts");
+	assert.equal(toHostPath("/host/proj", "/workspace", "/workspace/src/a.ts"), "/host/proj/src/a.ts");
+	assert.equal(toHostPath("/host/proj", "/workspace", "/"), "/host/proj");
+	assert.equal(hostPathToGuestPath("/host/proj", "/workspace", "/host/proj/src/a.ts"), "/workspace/src/a.ts");
+	assert.equal(hostPathToGuestPath("/host/proj", "/workspace", "/host/proj"), "/workspace");
+	assert.equal(hostPathToGuestPath("/host/proj", "/workspace", "/etc/passwd"), undefined);
+});
+
+test("gondolin write-op classification covers flags and mutating ops", () => {
+	assert.equal(isWriteFsOp("open", 0), false); // O_RDONLY
+	assert.equal(isWriteFsOp("open", 1), true); // O_WRONLY
+	assert.equal(isWriteFsOp("open", 2), true); // O_RDWR
+	assert.equal(isWriteFsOp("open", "r"), false);
+	assert.equal(isWriteFsOp("open", "w"), true);
+	assert.equal(isWriteFsOp("open", "a+"), true);
+	assert.equal(isWriteFsOp("mkdir", undefined), true);
+	assert.equal(isWriteFsOp("unlink", undefined), true);
+	assert.equal(isWriteFsOp("readdir", undefined), false);
+});
+
+test("gondolin guarded workspace provider denies with EACCES and skips handle I/O", async () => {
+	const backend = new MemoryProvider();
+	await backend.writeFile!("/secret.txt", Buffer.from("classified"));
+	await backend.writeFile!("/public.txt", Buffer.from("hello world"));
+
+	const guards = new Set<GondolinFsGuard>();
+	const seen: FsGuardRequest[] = [];
+	guards.add({
+		before: async (request) => {
+			seen.push(request);
+			return request.hostPath.endsWith("secret.txt") ? { reason: `denied ${request.hostPath}` } : undefined;
+		},
+		after: async () => {},
+	});
+
+	const provider = createGuardedWorkspaceProvider(backend, guards, "/host/proj", "/workspace");
+
+	await assert.rejects(provider.readFile("/secret.txt"), (error: unknown) => {
+		const err = error as NodeJS.ErrnoException;
+		assert.equal(err.code, "EACCES");
+		assert.equal(err.errno, 13);
+		assert.equal(err.message.includes("denied /host/proj/secret.txt"), true);
+		return true;
+	});
+
+	// Allowed path passes through and maps to the host path.
+	assert.equal((await provider.readFile("/public.txt")).toString(), "hello world");
+	assert.equal(seen.at(-1)?.hostPath, "/host/proj/public.txt");
+
+	// Write intent is detected from numeric open flags.
+	await provider.open("/public.txt", "r");
+	assert.equal(seen.at(-1)?.write, false);
+	await provider.open("/public.txt", "w");
+	assert.equal(seen.at(-1)?.write, true);
+
+	// The open gates the handle; readFile afterwards is a cheap re-check of the
+	// same (already allowed) path — no prompt, no error.
+	seen.length = 0;
+	const handle = await provider.open("/public.txt", "r");
+	await handle.readFile();
+	assert.deepEqual(seen.map((request) => request.op), ["open", "readFile"]);
+	assert.equal(seen.every((request) => !request.write), true);
+
+	// Rename consults the guard once per path.
+	seen.length = 0;
+	await assert.rejects(provider.rename("/public.txt", "/secret.txt"));
+	assert.deepEqual(
+		seen.map((request) => request.guestPath).sort(),
+		["/public.txt", "/secret.txt"],
+	);
+
+	// Unregistering stops enforcement.
+	guards.clear();
+	assert.equal((await provider.readFile("/secret.txt")).toString(), "classified");
+});
+
+test("gondolin stubifyEnv replaces credential values and names with stubs", () => {
+	const config = parseConfig({
+		enabled: true,
+		httpProxy: { secrets: { MY_TOKEN: { hosts: ["api.mine.dev"] } } },
+	});
+	const secrets = discoverSecrets({ MY_TOKEN: "real-secret-value" }, config, fixedRandom);
+	const stubbed = stubifyEnv(
+		{ MY_TOKEN: "real-secret-value", OTHER_KEY: "another-secret-value", UNRELATED: "plain" },
+		secrets,
+	);
+	assert.equal(stubbed.MY_TOKEN, secrets[0].placeholder);
+	assert.equal(stubbed.OTHER_KEY, "another-secret-value");
+	assert.equal(stubbed.UNRELATED, "plain");
+});
+
+test("gondolin execGuest launches via the guest shell with stubbed env", async () => {
+	const config = parseConfig({
+		enabled: true,
+		httpProxy: { secrets: { MY_TOKEN: { hosts: ["api.mine.dev"] } } },
+	});
+	const secrets = discoverSecrets({ MY_TOKEN: "real-secret-value" }, config, fixedRandom);
+
+	const calls: Array<{ command: unknown; options: Record<string, unknown> }> = [];
+	const fakeResult = { exitCode: 0, stdout: "", stderr: "" };
+	const fakeVm = {
+		exec(command: unknown, options: Record<string, unknown>) {
+			calls.push({ command, options });
+			return { write: () => {}, end: () => {}, stdout: null, stderr: null, result: Promise.resolve(fakeResult) };
+		},
+	} as unknown as VM;
+
+	const proc = launchGuestProcess(
+		fakeVm,
+		{ command: "npx", args: ["-y", "some mcp server"], env: { MY_TOKEN: "real-secret-value", EXTRA: "1" } },
+		secrets,
+		"/workspace",
+	);
+
+	assert.deepEqual(calls.length, 1);
+	assert.deepEqual(calls[0].command, ["/bin/sh", "-c", "exec 'npx' '-y' 'some mcp server'"]);
+	const options = calls[0].options;
+	assert.equal(options.cwd, "/workspace");
+	assert.equal(options.stdin, true);
+	assert.equal(options.stdout, "pipe");
+	assert.equal(options.stderr, "pipe");
+	const env = options.env as Record<string, string>;
+	assert.equal(env.MY_TOKEN, secrets[0].placeholder);
+	assert.equal(env.EXTRA, "1");
+	assert.equal(env.PATH, GUEST_BASE_ENV.PATH);
+	assert.equal(await proc.result, fakeResult);
 });

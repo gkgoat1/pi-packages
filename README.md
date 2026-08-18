@@ -6,7 +6,7 @@ A single installable Pi package that bundles:
 - **Workers** — disabled until its project policy explicitly enables persistent nested workers with strict caller-model routing.
 - **MCP Client** — disabled until its configuration explicitly enables the configurable stdio MCP bridge.
 - **Thinking Compression** — disabled until its config explicitly enables compression of finalized Pi thinking blocks; see [`extensions/thinking-compression/README.md`](extensions/thinking-compression/README.md).
-- **Gondolin Sandbox** — disabled until its config explicitly enables the QEMU micro-VM tool sandbox with credential-stub HTTP proxying; see [`extensions/gondolin/README.md`](extensions/gondolin/README.md).
+- **Gondolin Sandbox** — disabled until its config explicitly enables the QEMU micro-VM tool sandbox with credential-stub HTTP proxying; see [`extensions/gondolin/README.md`](extensions/gondolin/README.md). The running VM is published as a symbol-keyed global handle (`Symbol.for("pi-packages.gondolin.shared")`) so the other extensions reuse it without a dependency: File Guard switches to VM-filesystem interception instead of restricting tools, and MCP servers run inside the VM (opt-out via `"inVm": false`) — each only when both extensions are enabled.
 
 ## Install
 

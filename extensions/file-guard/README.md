@@ -9,6 +9,33 @@ File Guard has two **composable modes**:
 
 Both modes are disabled by default. Explicitly enable one or both via config or environment variables.
 
+## Gondolin interception mode
+
+When the [Gondolin sandbox](../gondolin) extension is also enabled, File Guard
+stops restricting tools and enforces its policy as **VM-filesystem
+interception** instead. Gondolin already runs `read`/`write`/`edit`/`bash`
+inside the sandbox VM, so guarding those tools again would only duplicate
+prompts (or worse, replace the VM-backed execution with host-backed execution).
+
+In interception mode:
+
+- **Guard mode** denies operations on paths outside the allowed set at the
+  sandbox VM's filesystem layer — the guest sees `EACCES` (Permission denied).
+  This covers every access path, not just the tools: shell commands, scripts,
+  anything the guest does to the mounted host workspace. The user is prompted
+  exactly like in tool mode, and decisions persist for the session.
+- **View mode** logs mutating filesystem operations inside the VM (plus the
+  host-side search tools) as timeline entries.
+
+The host-side `grep`/`find`/`ls` tools do not run in the VM, so they keep the
+regular tool-level guard. Interception activates only when both File Guard
+(guard mode) and Gondolin are enabled.
+
+The two extensions stay dependency-free: Gondolin publishes its VM under a
+registered symbol (`Symbol.for("pi-packages.gondolin.shared")`) and File Guard
+reads it at session start, then registers a filesystem guard. Inspect the state
+with `/file-guard` (the `Gondolin interception:` line).
+
 ## Key behaviour
 
 - **Non-blocking prompts.** All guarded built-in tools return a `[File Guard pending]` placeholder immediately so the agent can keep working. The actual execution (and its result) is held until the user approves it; the real result or a block notice is then delivered as a steering message tagged with the tool call ID.

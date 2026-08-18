@@ -20525,6 +20525,112 @@ __export(typebox_exports, {
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+// extensions/mcp-client/src/vm.ts
+var GONDOLIN_SHARED_KEY = /* @__PURE__ */ Symbol.for("pi-packages.gondolin.shared");
+function getGondolinHandle() {
+  const value = globalThis[GONDOLIN_SHARED_KEY];
+  if (typeof value !== "object" || value === null) return void 0;
+  const handle = value;
+  return handle.version === 1 ? handle : void 0;
+}
+function resolveRunInVm(shared, configInVm, serverInVm) {
+  if (!shared?.isEnabled()) return false;
+  return serverInVm ?? configInVm ?? true;
+}
+var CLOSE_GRACE_MS = 1500;
+var STDERR_TAIL_CHARS = 4e3;
+var VmMcpTransport = class {
+  constructor(shared, params) {
+    this.shared = shared;
+    this.params = params;
+  }
+  shared;
+  params;
+  onclose;
+  onerror;
+  onmessage;
+  readBuffer = new ReadBuffer();
+  proc;
+  abort;
+  stderrTail = "";
+  closed = false;
+  async start() {
+    if (this.proc) {
+      throw new Error("VmMcpTransport already started; Client.connect() calls start() automatically.");
+    }
+    this.abort = new AbortController();
+    await this.shared.ensureVm();
+    const proc = this.shared.execGuest({
+      command: this.params.command,
+      args: this.params.args,
+      env: this.params.env,
+      cwd: this.params.cwd,
+      signal: this.abort.signal
+    });
+    this.proc = proc;
+    proc.stdout?.on("data", (chunk) => {
+      this.readBuffer.append(chunk);
+      this.drain();
+    });
+    proc.stdout?.on("error", (error2) => this.onerror?.(error2));
+    proc.stderr?.on("data", (chunk) => {
+      this.stderrTail = (this.stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_CHARS);
+    });
+    void proc.result.then((result) => {
+      if (result.exitCode !== 0 && !this.closed) {
+        const detail = this.stderrTail.trim() || "(no stderr output)";
+        this.onerror?.(
+          new Error(
+            `MCP server exited inside the Gondolin VM with code ${result.exitCode}: ${detail}`
+          )
+        );
+      }
+      this.finish();
+    }).catch((error2) => {
+      this.onerror?.(error2 instanceof Error ? error2 : new Error(String(error2)));
+      this.finish();
+    });
+  }
+  async send(message) {
+    if (!this.proc) throw new Error("VmMcpTransport not started");
+    this.proc.write(serializeMessage(message));
+  }
+  async close() {
+    const proc = this.proc;
+    if (!proc) {
+      this.finish();
+      return;
+    }
+    proc.end();
+    const killTimer = setTimeout(() => this.abort?.abort(), CLOSE_GRACE_MS);
+    try {
+      await proc.result;
+    } catch {
+    } finally {
+      clearTimeout(killTimer);
+    }
+    this.finish();
+  }
+  drain() {
+    while (true) {
+      try {
+        const message = this.readBuffer.readMessage();
+        if (message === null) break;
+        this.onmessage?.(message);
+      } catch (error2) {
+        this.onerror?.(error2 instanceof Error ? error2 : new Error(String(error2)));
+      }
+    }
+  }
+  finish() {
+    if (this.closed) return;
+    this.closed = true;
+    this.onclose?.();
+  }
+};
+
+// extensions/mcp-client/index.ts
 var MAX_RESULT_CHARS = 5e4;
 var DEFAULT_PROMPT = [
   "MCP tools are external integrations. Use only an enabled MCP tool when its server-specific capability is needed.",
@@ -20568,6 +20674,7 @@ function parseConfig(value) {
   if (!object3) return {};
   const config2 = {
     enabled: typeof object3.enabled === "boolean" ? object3.enabled : void 0,
+    inVm: typeof object3.inVm === "boolean" ? object3.inVm : void 0,
     prompt: parsePrompt(object3.prompt),
     servers: {}
   };
@@ -20584,6 +20691,7 @@ function parseConfig(value) {
     if (typeof server.cwd === "string") parsedServer.cwd = server.cwd;
     if (env) parsedServer.env = env;
     if (typeof server.enabled === "boolean") parsedServer.enabled = server.enabled;
+    if (typeof server.inVm === "boolean") parsedServer.inVm = server.inVm;
     const tools = parseToolPolicy(server.tools);
     if (tools) parsedServer.tools = tools;
     const prompt = parsePrompt(server.prompt);
@@ -20614,6 +20722,7 @@ function mergeConfig(base, next) {
   }
   return {
     enabled: next.enabled ?? base.enabled,
+    inVm: next.inVm ?? base.inVm,
     servers,
     prompt: mergePrompt(base.prompt, next.prompt)
   };
@@ -20740,6 +20849,8 @@ function mcpClientExtension(pi) {
     const enabled = csv(process.env.PI_MCP_CLIENT_ENABLED_TOOLS);
     const disabled = csv(process.env.PI_MCP_CLIENT_DISABLED_TOOLS);
     const claimedNames = new Set(toolNames.values());
+    const gondolin = getGondolinHandle();
+    gondolin?.refreshTrust(ctx.isProjectTrusted());
     for (const [name, server] of Object.entries(config2.servers ?? {})) {
       if (server.enabled === false) continue;
       if (!server.command) {
@@ -20748,18 +20859,45 @@ function mcpClientExtension(pi) {
         continue;
       }
       try {
-        const transport = new StdioClientTransport({
-          command: server.command,
-          args: server.args,
-          cwd: server.cwd ?? ctx.cwd,
-          env: server.env ? Object.fromEntries(Object.entries({ ...process.env, ...server.env }).filter((entry) => typeof entry[1] === "string")) : void 0,
-          stderr: "pipe"
-        });
+        const runInVm = resolveRunInVm(gondolin, config2.inVm, server.inVm);
+        let transport;
+        if (runInVm && gondolin) {
+          let guestCwd;
+          if (server.cwd) {
+            guestCwd = gondolin.toGuestPath(server.cwd);
+            if (guestCwd === void 0 && ctx.hasUI) {
+              ctx.ui.notify(
+                `MCP server ${name}: cwd ${server.cwd} is outside the Gondolin workspace; using ${gondolin.guestWorkspace}.`,
+                "warning"
+              );
+            }
+          }
+          transport = new VmMcpTransport(gondolin, {
+            command: server.command,
+            args: server.args,
+            env: server.env,
+            cwd: guestCwd
+          });
+        } else {
+          if ((server.inVm ?? config2.inVm) === true && ctx.hasUI) {
+            ctx.ui.notify(
+              `MCP server ${name}: inVm is set but the Gondolin extension is not enabled; running on the host.`,
+              "warning"
+            );
+          }
+          transport = new StdioClientTransport({
+            command: server.command,
+            args: server.args,
+            cwd: server.cwd ?? ctx.cwd,
+            env: server.env ? Object.fromEntries(Object.entries({ ...process.env, ...server.env }).filter((entry) => typeof entry[1] === "string")) : void 0,
+            stderr: "pipe"
+          });
+        }
         const client = new Client({ name: "pi-mcp-client", version: "0.1.0" });
         await client.connect(transport);
         const response = await client.listTools();
         const tools = response.tools.filter((tool) => isEnabled(server, name, tool.name, enabled, disabled));
-        const connection = { name, client, transport, tools };
+        const connection = { name, client, transport, tools, ...runInVm ? { inVm: true } : {} };
         connected.set(name, connection);
         for (const tool of tools) {
           const nameInPi = uniquePiToolName(name, tool.name, claimedNames);
@@ -20810,7 +20948,7 @@ ${lines.join("\n\n")}` };
   pi.registerCommand("mcp-client", {
     description: "Show configured MCP servers and the MCP tools exposed to Pi",
     handler: async (_args, ctx) => {
-      const lines = [...connected.values()].map((server) => server.error ? `${server.name}: error \u2014 ${server.error}` : `${server.name}: ${server.tools.length ? server.tools.map((tool) => `${tool.name} \u2192 ${toolNames.get(toolKey(server.name, tool.name)) ?? piToolName(server.name, tool.name)}`).join(", ") : "no enabled tools"}`);
+      const lines = [...connected.values()].map((server) => server.error ? `${server.name}: error \u2014 ${server.error}` : `${server.name}${server.inVm ? " (vm)" : ""}: ${server.tools.length ? server.tools.map((tool) => `${tool.name} \u2192 ${toolNames.get(toolKey(server.name, tool.name)) ?? piToolName(server.name, tool.name)}`).join(", ") : "no enabled tools"}`);
       ctx.ui.notify(
         config2.enabled === true ? lines.join("\n") || startupError || "No MCP servers are configured." : 'MCP Client is disabled. Set "enabled": true in mcp-client.json or PI_MCP_CLIENT_CONFIG to enable it.',
         lines.some((line) => line.includes(": error")) ? "warning" : "info"

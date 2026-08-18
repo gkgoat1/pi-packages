@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "inVm": true,
   "prompt": {
     "append": "When using PDF evidence, state page numbers and distinguish extracted text from visually verified evidence."
   },

@@ -71,6 +71,44 @@ Layering: `~/.pi/agent/gondolin.json` ← trusted `.pi/gondolin.json` ← `PI_GO
 | `httpProxy.discoverKnownSecrets` | `true` | Disable to stub only `httpProxy.secrets` entries. |
 | `httpProxy.secrets` | `{}` | Custom credentials: `name → { hosts, envVar? }`. |
 
+## Shared VM handle (for the other extensions in this package)
+
+The running VM is published on `globalThis` under the registered symbol
+`Symbol.for("pi-packages.gondolin.shared")`, so other extensions can reuse it
+**without a dependency** (each extension is a separate bundle):
+
+```ts
+interface GondolinShared {
+	readonly version: 1;          // contract version
+	readonly hostCwd: string;     // host directory mounted in the guest
+	readonly guestWorkspace: string;
+	isEnabled(): boolean;
+	refreshTrust(isProjectTrusted: boolean): boolean;
+	ensureVm(): Promise<unknown>; // boot (or return) the VM
+	getVm(): unknown;
+	toGuestPath(hostPath: string): string | undefined;
+	registerFsGuard(guard: GondolinFsGuard): () => void; // returns unregister
+	execGuest(spec: GuestExecSpec): GuestProcess;
+}
+```
+
+- **`registerFsGuard`** adds a `before`/`after` hook on every filesystem
+  operation against the mounted host workspace. Returning a decision from
+  `before` denies the operation (`EACCES` inside the guest). Guards are
+  consulted dynamically, so they can be registered before or after the VM
+  boots. This is [File Guard](../file-guard)'s interception mode.
+- **`execGuest`** starts a long-running process inside the VM with piped
+  stdio. The guest env is the minimal base plus credential stubs; env values
+  matching discovered secrets are stubbed so real keys stay host-side (the
+  HTTP proxy inflates them back on egress). This is how the
+  [MCP client](../mcp-client) runs servers in-VM.
+- **`refreshTrust`** re-reads this extension's config with the session's
+  project-trust decision, so earlier-loaded extensions see the correct
+  enabled state.
+
+Both consumers activate only when this extension **and** the consumer
+extension are enabled.
+
 ## Limits
 
 - Gondolin's proxy blocks internal IP ranges by default (`blockInternalRanges`); direct SSH egress and DNS modes are available in gondolin itself but not configured here.

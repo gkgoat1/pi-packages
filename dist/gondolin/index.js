@@ -1,14 +1,14 @@
 const __filename = 'nope';import { createRequire as __createRequire } from 'node:module';const require = __createRequire(import.meta.url);
 
 // extensions/gondolin/index.ts
-import path2 from "node:path";
+import path3 from "node:path";
 import {
   createBashTool,
   createEditTool,
   createReadTool,
   createWriteTool
 } from "@earendil-works/pi-coding-agent";
-import { RealFSProvider, VM, createHttpHooks } from "@earendil-works/gondolin";
+import { VM, createHttpHooks } from "@earendil-works/gondolin";
 
 // extensions/gondolin/src/config.ts
 import { existsSync, readFileSync } from "node:fs";
@@ -84,10 +84,10 @@ function parseConfig(value) {
   if (allowedHosts) config.allowedHosts = allowedHosts;
   return config;
 }
-function readConfigFile(path3) {
-  if (!existsSync(path3)) return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
+function readConfigFile(path4) {
+  if (!existsSync(path4)) return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
   try {
-    return parseConfig(JSON.parse(readFileSync(path3, "utf8")));
+    return parseConfig(JSON.parse(readFileSync(path4, "utf8")));
   } catch {
     return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
   }
@@ -415,9 +415,160 @@ function createGondolinBashOps(vm, localCwd, guestWorkspace, envOptions) {
   };
 }
 
+// extensions/gondolin/src/shared.ts
+import path2 from "node:path";
+import { RealFSProvider, SandboxVfsProvider } from "@earendil-works/gondolin";
+var GONDOLIN_SHARED_KEY = /* @__PURE__ */ Symbol.for("pi-packages.gondolin.shared");
+var SKIP_FS_OPS = /* @__PURE__ */ new Set([
+  "read",
+  "readSync",
+  "write",
+  "writeSync",
+  "release",
+  "releaseSync",
+  "close",
+  "closeSync",
+  "fsync",
+  "fsyncSync",
+  "flush",
+  "statfs",
+  "statfsSync",
+  "watch",
+  "watchAsync",
+  "watchFile",
+  "unwatchFile",
+  "readlink",
+  "readlinkSync",
+  "realpath",
+  "realpathSync"
+]);
+var WRITE_FS_OPS = /* @__PURE__ */ new Set([
+  "create",
+  "mknod",
+  "mkdir",
+  "mkdirSync",
+  "rmdir",
+  "rmdirSync",
+  "unlink",
+  "unlinkSync",
+  "rename",
+  "renameSync",
+  "link",
+  "linkSync",
+  "symlink",
+  "symlinkSync",
+  "truncate",
+  "truncateSync",
+  "writeFile",
+  "writeFileSync",
+  "setattr",
+  "utimens",
+  "chmod",
+  "chown"
+]);
+var O_ACCMODE = 3;
+function isWriteFsOp(op, flags) {
+  if (WRITE_FS_OPS.has(op)) return true;
+  if (op !== "open" && op !== "openSync") return false;
+  if (typeof flags === "number") return (flags & O_ACCMODE) !== 0;
+  return typeof flags === "string" ? /[wa+]/.test(flags) : false;
+}
+function toHostPath(hostCwd, guestWorkspace, vfsPath) {
+  let p = vfsPath;
+  if (guestWorkspace && (p === guestWorkspace || p.startsWith(`${guestWorkspace}/`))) {
+    p = p.slice(guestWorkspace.length);
+  }
+  p = p.replace(/^\/+/, "");
+  if (p === "" || p === ".") return hostCwd;
+  return path2.resolve(hostCwd, p);
+}
+function hostPathToGuestPath(hostCwd, guestWorkspace, hostPath) {
+  const rel = path2.relative(hostCwd, hostPath);
+  if (rel === "") return guestWorkspace;
+  if (rel.startsWith("..") || path2.isAbsolute(rel)) return void 0;
+  return path2.posix.join(guestWorkspace, rel.split(path2.sep).join("/"));
+}
+function createEaccesError(syscall, vfsPath, reason) {
+  const error = new Error(`File Guard: ${reason}`);
+  error.errno = 13;
+  error.code = "EACCES";
+  error.syscall = syscall;
+  error.path = vfsPath;
+  return error;
+}
+function createGuardedWorkspaceProvider(backend, guards, hostCwd, guestWorkspace) {
+  const requestFor = (op, vfsPath, write) => ({
+    op,
+    guestPath: vfsPath,
+    hostPath: toHostPath(hostCwd, guestWorkspace, vfsPath),
+    write
+  });
+  return new SandboxVfsProvider(backend, {
+    before: async (hook) => {
+      if (SKIP_FS_OPS.has(hook.op)) return;
+      const write = isWriteFsOp(hook.op, hook.flags);
+      const paths = [hook.path, hook.oldPath, hook.newPath].filter(
+        (p) => typeof p === "string" && p.length > 0
+      );
+      const unique = [...new Set(paths)];
+      for (const p of unique) {
+        const request = requestFor(hook.op, p, write);
+        for (const guard of guards) {
+          const decision = await guard.before?.(request);
+          if (decision) throw createEaccesError(hook.op, p, decision.reason);
+        }
+      }
+    },
+    after: async (hook) => {
+      if (SKIP_FS_OPS.has(hook.op)) return;
+      const paths = [hook.path, hook.oldPath, hook.newPath].filter(
+        (p) => typeof p === "string" && p.length > 0
+      );
+      const write = isWriteFsOp(hook.op, hook.flags);
+      for (const p of new Set(paths)) {
+        const request = requestFor(hook.op, p, write);
+        for (const guard of guards) {
+          void guard.after?.(request).catch(() => {
+          });
+        }
+      }
+    }
+  });
+}
+function stubifyEnv(env, secrets) {
+  if (secrets.length === 0) return env;
+  const byValue = new Map(secrets.map((secret) => [secret.value, secret.placeholder]));
+  const byName = new Map(secrets.map((secret) => [secret.name, secret.placeholder]));
+  const stubbed = {};
+  for (const [key, value] of Object.entries(env)) {
+    stubbed[key] = byValue.get(value) ?? byName.get(key) ?? value;
+  }
+  return stubbed;
+}
+function launchGuestProcess(vm, spec, secrets, guestWorkspace) {
+  const quoted = [spec.command, ...spec.args ?? []].map(shQuote).join(" ");
+  const env = {
+    ...GUEST_BASE_ENV,
+    ...buildStubEnv(secrets),
+    ...stubifyEnv(spec.env ?? {}, secrets)
+  };
+  return vm.exec(["/bin/sh", "-c", `exec ${quoted}`], {
+    cwd: spec.cwd ?? guestWorkspace,
+    env,
+    stdin: true,
+    stdout: "pipe",
+    stderr: "pipe",
+    ...spec.signal ? { signal: spec.signal } : {}
+  });
+}
+function installGondolinShared(handle) {
+  globalThis[GONDOLIN_SHARED_KEY] = handle;
+}
+
 // extensions/gondolin/index.ts
 function gondolinExtension(pi) {
   const localCwd = process.cwd();
+  const fsGuards = /* @__PURE__ */ new Set();
   const localRead = createReadTool(localCwd);
   const localWrite = createWriteTool(localCwd);
   const localEdit = createEditTool(localCwd);
@@ -425,6 +576,36 @@ function gondolinExtension(pi) {
   let config = loadConfig({ cwd: localCwd, isProjectTrusted: () => false });
   const state = { vm: null, starting: null, error: void 0, secrets: [] };
   const trustedRef = { value: false };
+  const shared = {
+    version: 1,
+    get hostCwd() {
+      return localCwd;
+    },
+    get guestWorkspace() {
+      return config.guestWorkspace;
+    },
+    isEnabled: () => config.enabled,
+    refreshTrust: (isProjectTrusted) => {
+      trustedRef.value = isProjectTrusted;
+      config = loadConfig({ cwd: localCwd, isProjectTrusted: () => trustedRef.value });
+      return config.enabled;
+    },
+    ensureVm: () => ensureVm(),
+    getVm: () => state.vm,
+    toGuestPath: (hostPath) => hostPathToGuestPath(localCwd, config.guestWorkspace, hostPath),
+    registerFsGuard: (guard) => {
+      fsGuards.add(guard);
+      return () => {
+        fsGuards.delete(guard);
+      };
+    },
+    execGuest: (spec) => {
+      const vm = state.vm;
+      if (!vm) throw new Error("Gondolin VM is not running; await ensureVm() before execGuest()");
+      return launchGuestProcess(vm, spec, state.secrets, config.guestWorkspace);
+    }
+  };
+  installGondolinShared(shared);
   function statusLine(ctx, text, tone = "accent") {
     ctx.ui.setStatus("gondolin", ctx.ui.theme.fg(tone, `Gondolin: ${text}`));
   }
@@ -454,11 +635,19 @@ function gondolinExtension(pi) {
           ...config.image ? { imagePath: config.image } : {}
         },
         vfs: {
+          // The host workspace is mounted through a guardable provider so
+          // other extensions (File Guard) can enforce policy at the VM
+          // filesystem layer instead of restricting the tools themselves.
           mounts: {
-            [guestWorkspace]: new RealFSProvider(localCwd)
+            [guestWorkspace]: createGuardedWorkspaceProvider(
+              new RealFSProvider(localCwd),
+              fsGuards,
+              localCwd,
+              guestWorkspace
+            )
           }
         },
-        sessionLabel: `pi-gondolin:${path2.basename(localCwd)}`
+        sessionLabel: `pi-gondolin:${path3.basename(localCwd)}`
       });
       state.vm = created;
       state.error = void 0;
@@ -579,7 +768,8 @@ function gondolinExtension(pi) {
       const lines = [
         `vm: ${state.vm ? "running" : state.starting ? "starting" : state.error ? `failed \u2014 ${state.error}` : "not started"}`,
         `accel: ${config.accel} (QEMU; "tcg" = software emulation, nested-VM safe)`,
-        `mount: ${localCwd} \u2192 ${config.guestWorkspace}`
+        `mount: ${localCwd} \u2192 ${config.guestWorkspace}`,
+        `shared handle: published (fs guards: ${fsGuards.size})`
       ];
       if (config.httpProxy.enabled) {
         const allowedHosts = config.allowedHosts ? config.allowedHosts.join(", ") || "(deny all)" : "(allow all hosts)";

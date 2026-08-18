@@ -71,6 +71,41 @@ PI_MCP_CLIENT_CONFIG='{"enabled":true}' PI_MCP_CLIENT_ENABLED_TOOLS='pdf-reader/
 
 Run `/mcp-client` to show which servers connected and the exact Pi tool names. Registered names are deterministic: `mcp_<server>_<tool>` (for example `mcp_pdf_reader_read_pdf`). If normalization or the 64-character name limit produces a collision, a deterministic numeric suffix is added; `/mcp-client` always shows the actual registered name.
 
+## Running servers inside the Gondolin VM
+
+When the [Gondolin sandbox](../gondolin) extension is enabled, MCP servers run
+**inside the sandbox VM** by default instead of on the host: their process,
+filesystem view, and network egress are confined to the VM (the host workspace
+is mounted at `/workspace`, and credential stubs are inflated back into real
+keys by the sandbox HTTP proxy — only for each credential's allowed hosts).
+
+Notes:
+
+- The `command` is resolved through the **guest** `$PATH`. The default guest is
+  a minimal Alpine image; `npx`/`node`/`python` based servers need the runtime
+  installed in the guest first (or opt out).
+- `env` values that match credentials discovered by Gondolin are replaced with
+  stubs automatically, so real keys never reach the guest.
+- `cwd` is mapped into the guest workspace when it lies under the host project
+  directory; otherwise the workspace root is used.
+
+Opt out globally or per server (`server.inVm` wins over the top-level `inVm`;
+in-VM is the default whenever Gondolin is active):
+
+```json
+{
+	"enabled": true,
+	"inVm": true,
+	"servers": {
+		"needs-host-tools": { "command": "npx", "args": ["-y", "some-server"], "inVm": false }
+	}
+}
+```
+
+`/mcp-client` annotates in-VM servers with `(vm)`. If `inVm` is set but the
+Gondolin extension is not enabled, the server falls back to the host with a
+warning.
+
 ## PDF Reader MCP preset
 
 The published stable PDF Reader MCP version is `@sylphx/pdf-reader-mcp@3.0.14`; its maintainers explicitly advise pinning it and require Node.js `>=22.13`. The supplied preset uses its three-tool evidence-first surface:
