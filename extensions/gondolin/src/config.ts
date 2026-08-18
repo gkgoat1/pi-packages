@@ -23,9 +23,10 @@
  * Mounts: the host workspace is always mounted read-write at
  * `guestWorkspace`. Extra host folders come from the `mounts` config key
  * (`"<host path>": "ro" | "rw" | { "access": ..., "guestPath": ... }`,
- * `~` expanded, `"skills"` aliases the global skills directory). When no
- * config mentions `mounts`, the default is the global skills directory
- * mounted read-only and nothing else.
+ * `~` expanded, `"skills"` aliases the global skills directories). When no
+ * config mentions `mounts`, the default is the global skills directories
+ * (`~/.agents/skills` and `~/.pi/agent/skills`) mounted read-only and
+ * nothing else.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -128,18 +129,35 @@ const DEFAULTS: GondolinConfig = {
 	mounts: [],
 };
 
-/** Guest path where the global skills directory is mounted by default. */
-export const SKILLS_GUEST_PATH = "/root/.pi/agent/skills";
+/**
+ * Host directories treated as global skills, in ceiling order. The standard
+ * cross-agent `~/.agents/skills` and the Pi-specific `~/.pi/agent/skills`
+ * are both mounted by default, so skills installed by either convention are
+ * visible in the sandbox.
+ */
+export function skillsHostPaths(home: string = homedir()): string[] {
+	return [join(home, ".pi", "agent", "skills"), join(home, ".agents", "skills")];
+}
 
-/** Default mount ceiling: global skills read-only, nothing else. */
+/**
+ * Default guest mirror for a skills host dir: the host layout under the home
+ * directory is replayed under the guest `HOME` (`/root`), so `$HOME`-relative
+ * skill paths resolve naturally. Returns undefined for non-skills host paths.
+ */
+export function defaultSkillsGuestPath(hostPath: string, home: string = homedir()): string | undefined {
+	for (const root of skillsHostPaths(home)) {
+		if (hostPath === root) return "/root" + hostPath.slice(home.length);
+	}
+	return undefined;
+}
+
+/** Default mount ceiling: the skills directories read-only, nothing else. */
 export function defaultMounts(home: string = homedir()): MountConfig[] {
-	return [
-		{
-			hostPath: join(home, ".pi", "agent", "skills"),
-			access: "ro",
-			guestPath: SKILLS_GUEST_PATH,
-		},
-	];
+	return skillsHostPaths(home).map((hostPath) => ({
+		hostPath,
+		access: "ro" as const,
+		guestPath: defaultSkillsGuestPath(hostPath, home)!,
+	}));
 }
 
 /** Default config with fresh empty containers (avoids shared mutation). */
@@ -188,15 +206,16 @@ function parseSecretSpec(value: unknown): SecretSpec | null | undefined {
 }
 
 /**
- * Resolve a mounts-map key to an absolute host path. `~` is expanded against
- * the home directory and the alias `skills` names the global skills dir.
+ * Resolve a mounts-map key to absolute host path(s). `~` is expanded against
+ * the home directory; the alias `skills` names both skills directories (the
+ * standard `~/.agents/skills` and the Pi-specific `~/.pi/agent/skills`).
  * Returns undefined for keys that are neither absolute nor `~`-relative.
  */
-export function normalizeHostKey(key: string, home: string): string | undefined {
-	if (key === "skills") return join(home, ".pi", "agent", "skills");
-	if (key === "~") return home;
-	if (key.startsWith("~/")) return join(home, key.slice(2));
-	if (key.startsWith("/")) return key;
+export function normalizeHostKey(key: string, home: string): string[] | undefined {
+	if (key === "skills") return skillsHostPaths(home);
+	if (key === "~") return [home];
+	if (key.startsWith("~/")) return [join(home, key.slice(2))];
+	if (key.startsWith("/")) return [key];
 	return undefined;
 }
 
@@ -204,11 +223,10 @@ function normalizeGuestPath(value: unknown, hostPath: string, home: string): str
 	let guestPath: string | undefined;
 	if (typeof value === "string" && value.startsWith("/")) guestPath = value;
 	if (!guestPath) {
-		// Default: mirror the skills layout for the skills dir, /mnt/<name> otherwise.
-		guestPath =
-			hostPath === join(home, ".pi", "agent", "skills")
-				? SKILLS_GUEST_PATH
-				: `/mnt/${basename(hostPath)}`;
+		// Default: skills dirs mirror their host layout under the guest HOME
+		// (/root) so $HOME-relative skill paths resolve; other folders mount
+		// at /mnt/<name>.
+		guestPath = defaultSkillsGuestPath(hostPath, home) ?? `/mnt/${basename(hostPath)}`;
 	}
 	const segments: string[] = [];
 	for (const segment of guestPath.split("/")) {
@@ -226,8 +244,8 @@ function parseMountsValue(raw: unknown): MountConfig[] {
 	const home = homedir();
 	const byHost = new Map<string, MountConfig>();
 	for (const [key, value] of Object.entries(object)) {
-		const hostPath = normalizeHostKey(key, home);
-		if (!hostPath) continue;
+		const paths = normalizeHostKey(key, home);
+		if (!paths) continue;
 		let access: "ro" | "rw";
 		let guestRaw: unknown;
 		if (value === "ro" || value === "rw") access = value;
@@ -237,9 +255,11 @@ function parseMountsValue(raw: unknown): MountConfig[] {
 			else continue;
 			guestRaw = asObject(value)?.guestPath;
 		} else continue; // "none"/unknown values mean "do not mount"
-		const guestPath = normalizeGuestPath(guestRaw, hostPath, home);
-		if (!guestPath) continue;
-		byHost.set(hostPath, { hostPath, access, guestPath });
+		for (const hostPath of paths) {
+			const guestPath = normalizeGuestPath(guestRaw, hostPath, home);
+			if (!guestPath) continue;
+			byHost.set(hostPath, { hostPath, access, guestPath });
+		}
 	}
 	// Later entries win guest-path collisions (same host key already replaced).
 	const mounts: MountConfig[] = [];

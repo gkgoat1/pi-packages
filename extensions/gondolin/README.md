@@ -23,7 +23,7 @@ Set `"enabled": true` in `~/.pi/agent/gondolin.json` (global) or `.pi/gondolin.j
 }
 ```
 
-That is enough for the defaults: `tcg` acceleration, `/workspace` mount, the global skills directory mounted read-only, HTTP proxying on, well-known API keys discovered from the environment.
+That is enough for the defaults: `tcg` acceleration, `/workspace` mount, the global skills directories (`~/.agents/skills` and `~/.pi/agent/skills`) mounted read-only, HTTP proxying on, well-known API keys discovered from the environment.
 
 ## What it does
 
@@ -46,9 +46,9 @@ The host working directory is always mounted read-write at `guestWorkspace`. Add
 }
 ```
 
-- Keys are host paths (`~` expanded), absolute paths, or the alias `skills` for `~/.pi/agent/skills`.
-- Values are `"ro"` (writes fail with `EROFS`), `"rw"`, or `{ "access": …, "guestPath": … }`. Guest paths default to `/mnt/<name>` (skills: `/root/.pi/agent/skills`, so `$HOME`-relative skill paths resolve naturally — the guest `HOME` is `/root`).
-- With no `mounts` key anywhere, the default is exactly the global skills directory, read-only, and nothing else. Listing `mounts` **replaces** that default.
+- Keys are host paths (`~` expanded), absolute paths, or the alias `skills` — which expands to **both** skills directories: the standard `~/.agents/skills` and the Pi-specific `~/.pi/agent/skills`.
+- Values are `"ro"` (writes fail with `EROFS`), `"rw"`, or `{ "access": …, "guestPath": … }`. Guest paths default to `/mnt/<name>` (skills dirs mirror their host layout under `/root` — `/root/.agents/skills`, `/root/.pi/agent/skills` — so `$HOME`-relative skill paths resolve naturally; the guest `HOME` is `/root`).
+- With no `mounts` key anywhere, the default is exactly the two skills directories, read-only, and nothing else. Listing `mounts` **replaces** that default (to keep only one skills dir, spell its `~` path out and omit the other).
 - Mounts also flow through the guardable provider used by File Guard's interception mode: writes to read-write extras are mediated, and the system prompt tells the agent the host↔guest path mapping.
 
 **Capability ceiling**: the *global* config (or env) defines the maximum — which host folders may be mounted and at what access. Repo config can only restrict: drop a mount (omit it) or downgrade `rw` → `ro`. A repo can never add a host folder the global config did not grant, and a `rw` request under a `ro` ceiling is clamped to `ro`. This holds for trusted and untrusted repos alike.
@@ -99,7 +99,7 @@ See "Who may configure what" above for the layering rules.
 | `enabled` | `false` | Explicit opt-in. |
 | `accel` | `"tcg"` | QEMU acceleration backend. `tcg` = software emulation (nested-VM safe). |
 | `guestWorkspace` | `"/workspace"` | Guest mount point for the host working directory. |
-| `mounts` | skills dir as `ro` | Extra host folders: `host path → "ro" \| "rw" \| { access, guestPath }`. Global/env layers set the ceiling; repo layers can only restrict. |
+| `mounts` | skills dirs as `ro` | Extra host folders: `host path → "ro" \| "rw" \| { access, guestPath }`. Global/env layers set the ceiling; repo layers can only restrict. |
 | `memory` | gondolin default (`1G`) | VM memory (QEMU syntax). |
 | `cpus` | gondolin default | VM cpu count. |
 | `image` | latest `alpine-base` | Guest image selector or asset directory. |

@@ -28,15 +28,21 @@ var DEFAULTS = {
   },
   mounts: []
 };
-var SKILLS_GUEST_PATH = "/root/.pi/agent/skills";
+function skillsHostPaths(home = homedir()) {
+  return [join(home, ".pi", "agent", "skills"), join(home, ".agents", "skills")];
+}
+function defaultSkillsGuestPath(hostPath, home = homedir()) {
+  for (const root of skillsHostPaths(home)) {
+    if (hostPath === root) return "/root" + hostPath.slice(home.length);
+  }
+  return void 0;
+}
 function defaultMounts(home = homedir()) {
-  return [
-    {
-      hostPath: join(home, ".pi", "agent", "skills"),
-      access: "ro",
-      guestPath: SKILLS_GUEST_PATH
-    }
-  ];
+  return skillsHostPaths(home).map((hostPath) => ({
+    hostPath,
+    access: "ro",
+    guestPath: defaultSkillsGuestPath(hostPath, home)
+  }));
 }
 function withDefaults() {
   return {
@@ -62,17 +68,17 @@ function parseSecretSpec(value) {
   return spec;
 }
 function normalizeHostKey(key, home) {
-  if (key === "skills") return join(home, ".pi", "agent", "skills");
-  if (key === "~") return home;
-  if (key.startsWith("~/")) return join(home, key.slice(2));
-  if (key.startsWith("/")) return key;
+  if (key === "skills") return skillsHostPaths(home);
+  if (key === "~") return [home];
+  if (key.startsWith("~/")) return [join(home, key.slice(2))];
+  if (key.startsWith("/")) return [key];
   return void 0;
 }
 function normalizeGuestPath(value, hostPath, home) {
   let guestPath;
   if (typeof value === "string" && value.startsWith("/")) guestPath = value;
   if (!guestPath) {
-    guestPath = hostPath === join(home, ".pi", "agent", "skills") ? SKILLS_GUEST_PATH : `/mnt/${basename(hostPath)}`;
+    guestPath = defaultSkillsGuestPath(hostPath, home) ?? `/mnt/${basename(hostPath)}`;
   }
   const segments = [];
   for (const segment of guestPath.split("/")) {
@@ -89,8 +95,8 @@ function parseMountsValue(raw) {
   const home = homedir();
   const byHost = /* @__PURE__ */ new Map();
   for (const [key, value] of Object.entries(object)) {
-    const hostPath = normalizeHostKey(key, home);
-    if (!hostPath) continue;
+    const paths = normalizeHostKey(key, home);
+    if (!paths) continue;
     let access;
     let guestRaw;
     if (value === "ro" || value === "rw") access = value;
@@ -100,9 +106,11 @@ function parseMountsValue(raw) {
       else continue;
       guestRaw = asObject(value)?.guestPath;
     } else continue;
-    const guestPath = normalizeGuestPath(guestRaw, hostPath, home);
-    if (!guestPath) continue;
-    byHost.set(hostPath, { hostPath, access, guestPath });
+    for (const hostPath of paths) {
+      const guestPath = normalizeGuestPath(guestRaw, hostPath, home);
+      if (!guestPath) continue;
+      byHost.set(hostPath, { hostPath, access, guestPath });
+    }
   }
   const mounts = [];
   for (const entry of byHost.values()) {

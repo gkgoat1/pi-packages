@@ -4,9 +4,11 @@ import {
 	DEFAULTS_PLACEHOLDER,
 	applyLayer,
 	defaultMounts,
+	defaultSkillsGuestPath,
 	envConfig,
 	loadConfig,
 	mergeConfig,
+	normalizeHostKey,
 	parseConfig,
 	parseEnablementEnv,
 	parseLayer,
@@ -509,17 +511,18 @@ test("gondolin parseEnablementEnv recognizes force and dangerously-force-disable
 	assert.equal(parse("0"), false);
 });
 
-test("gondolin default mounts are the skills dir, read-only", () => {
+test("gondolin default mounts are the skills dirs, read-only", () => {
 	const mounts = defaultMounts("/home/me");
 	assert.deepEqual(mounts, [
 		{ hostPath: "/home/me/.pi/agent/skills", access: "ro", guestPath: "/root/.pi/agent/skills" },
+		{ hostPath: "/home/me/.agents/skills", access: "ro", guestPath: "/root/.agents/skills" },
 	]);
 });
 
 test("gondolin parseConfig mounts default to skills, and explicit mounts replace", () => {
 	const disabled = parseConfig({});
-	assert.equal(disabled.mounts.length, 1);
-	assert.equal(disabled.mounts[0].access, "ro");
+	assert.equal(disabled.mounts.length, 2);
+	assert.equal(disabled.mounts.every((m) => m.access === "ro"), true);
 
 	const enabled = parseConfig({
 		enabled: true,
@@ -531,13 +534,54 @@ test("gondolin parseConfig mounts default to skills, and explicit mounts replace
 			"skills-dup": "rw",
 		},
 	});
-	// skills alias + ~ expansion + explicit guest path honored; relative key ignored.
+	// skills alias expands to both dirs; ~ expansion + explicit guest path honored; relative key ignored.
 	assert.deepEqual(
 		enabled.mounts.map((m) => ({ hostPath: m.hostPath, access: m.access, guestPath: m.guestPath })),
 		[
 			{ hostPath: join(homedir(), ".pi", "agent", "skills"), access: "ro", guestPath: "/root/.pi/agent/skills" },
+			{ hostPath: join(homedir(), ".agents", "skills"), access: "ro", guestPath: "/root/.agents/skills" },
 			{ hostPath: join(homedir(), "docs"), access: "rw", guestPath: "/mnt/docs" },
 			{ hostPath: "/abs/ref", access: "ro", guestPath: "/ref" },
+		],
+	);
+});
+
+test("gondolin normalizeHostKey expands the skills alias to both dirs", () => {
+	assert.deepEqual(normalizeHostKey("skills", "/home/me"), [
+		"/home/me/.pi/agent/skills",
+		"/home/me/.agents/skills",
+	]);
+	assert.deepEqual(normalizeHostKey("~", "/home/me"), ["/home/me"]);
+	assert.deepEqual(normalizeHostKey("~/x", "/home/me"), ["/home/me/x"]);
+	assert.deepEqual(normalizeHostKey("/abs", "/home/me"), ["/abs"]);
+	assert.equal(normalizeHostKey("relative", "/home/me"), undefined);
+});
+
+test("gondolin defaultSkillsGuestPath mirrors skills dirs under /root", () => {
+	const home = "/home/me";
+	assert.equal(defaultSkillsGuestPath(join(home, ".pi", "agent", "skills"), home), "/root/.pi/agent/skills");
+	assert.equal(defaultSkillsGuestPath(join(home, ".agents", "skills"), home), "/root/.agents/skills");
+	assert.equal(defaultSkillsGuestPath(join(home, "docs"), home), undefined);
+});
+
+test("gondolin explicit skills paths mirror their host layout under /root", () => {
+	// Explicit ~ paths get the skills default guest path too, so one dir can be
+	// dropped or upgraded without touching the other.
+	const onlyAgents = parseConfig({ enabled: true, mounts: { "~/.agents/skills": "rw" } });
+	assert.deepEqual(onlyAgents.mounts, [
+		{ hostPath: join(homedir(), ".agents", "skills"), access: "rw", guestPath: "/root/.agents/skills" },
+	]);
+
+	// A later explicit key overrides one dir of the alias (order: later wins).
+	const overridden = parseConfig({
+		enabled: true,
+		mounts: { "skills": "ro", "~/.agents/skills": { access: "rw", guestPath: "/skills" } },
+	});
+	assert.deepEqual(
+		overridden.mounts.map((m) => `${m.hostPath}:${m.access}:${m.guestPath}`),
+		[
+			`${join(homedir(), ".pi", "agent", "skills")}:ro:/root/.pi/agent/skills`,
+			`${join(homedir(), ".agents", "skills")}:rw:/skills`,
 		],
 	);
 });
@@ -584,9 +628,10 @@ test("gondolin applyLayer trusted overrides prefs but restricts mounts", () => {
 	assert.equal(out.accel, "hvf");
 	assert.deepEqual(out.allowedHosts, ["a.example"]);
 	assert.deepEqual(out.envPassthrough, ["LANG", "TZ"]); // trusted override: absent = keep base
-	// mounts restricted: docs dropped, skills kept ro.
+	// mounts restricted: docs dropped, both skills dirs kept ro.
 	assert.deepEqual(out.mounts, [
 		{ hostPath: join(homedir(), ".pi", "agent", "skills"), access: "ro", guestPath: "/root/.pi/agent/skills" },
+		{ hostPath: join(homedir(), ".agents", "skills"), access: "ro", guestPath: "/root/.agents/skills" },
 	]);
 	// secret survives (trusted full override, repo didn't touch it).
 	assert.deepEqual(Object.keys(out.httpProxy.secrets), ["A"]);
@@ -624,11 +669,11 @@ test("gondolin applyLayer untrusted can only restrict", () => {
 	assert.deepEqual(out.httpProxy.secrets.A.hosts, ["a.example"]);
 	assert.deepEqual(
 		out.mounts.map((m) => m.access),
-		["ro", "ro"],
+		["ro", "ro", "ro"],
 	);
 	assert.deepEqual(
 		out.mounts.map((m) => m.hostPath),
-		[join(homedir(), ".pi", "agent", "skills"), join(homedir(), "docs")],
+		[join(homedir(), ".pi", "agent", "skills"), join(homedir(), ".agents", "skills"), join(homedir(), "docs")],
 	);
 });
 
@@ -698,6 +743,7 @@ test("gondolin loadConfig layers global ceiling and repo restrictions", async ()
 		assert.equal(trusted.accel, "hvf");
 		assert.deepEqual(trusted.mounts, [
 			{ hostPath: join(home, ".pi", "agent", "skills"), access: "ro", guestPath: "/root/.pi/agent/skills" },
+			{ hostPath: join(home, ".agents", "skills"), access: "ro", guestPath: "/root/.agents/skills" },
 		]);
 
 		// untrusted repo can only restrict.
@@ -786,6 +832,7 @@ test("gondolin buildSandboxPromptAddendum lists mounts and proxy stubs", () => {
 	assert.equal(addendum.includes("## Gondolin sandbox"), true);
 	assert.equal(addendum.includes("read-write at /workspace"), true);
 	assert.equal(addendum.includes("/root/.pi/agent/skills"), true);
+	assert.equal(addendum.includes("/root/.agents/skills"), true);
 	assert.equal(addendum.includes("read-only"), true);
 	assert.equal(addendum.includes("gondolin-stub-"), true);
 
