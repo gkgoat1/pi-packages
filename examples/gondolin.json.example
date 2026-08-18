@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "accel": "tcg",
+  "guestWorkspace": "/workspace",
+  "allowedHosts": null,
+  "envPassthrough": ["TZ"],
+  "httpProxy": {
+    "enabled": true,
+    "discoverKnownSecrets": true,
+    "secrets": {
+      "MY_SERVICE_TOKEN": {
+        "hosts": ["api.myservice.com", "*.myservice.dev"],
+        "envVar": "MY_SERVICE_TOKEN"
+      }
+    }
+  }
+}

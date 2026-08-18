@@ -8,27 +8,32 @@ Replace `/path/to/pi-packages` with the installed package directory. For npm and
 
 ```json
 {
-  "extensions": ["/path/to/pi-packages/extensions/file-guard"]
+  "extensions": ["/path/to/pi-packages/dist/file-guard"]
 }
-```
 ```
 
 Choose one of these exact paths:
 
-- `extensions/file-guard/index.ts`
-- `extensions/mcp-client/index.ts`
-- `extensions/workers/index.ts`
+- `dist/file-guard/index.js`
+- `dist/mcp-client/index.js`
+- `dist/workers/index.js`
+- `dist/thinking-compression/index.js`
+- `dist/gondolin/index.js` (requires this package's `node_modules` for the external `@earendil-works/gondolin` dependency)
+
+The `dist/` bundles are self-contained: their non-Pi dependencies are inlined, so they load even when the package's `node_modules` is cleared. The TypeScript sources under `extensions/` are for development and require the package's `node_modules` to be installed.
 
 ## Enable all bundled extensions (then opt each in at runtime)
 
 ```json
 {
   "extensions": [
-    "/path/to/pi-packages/extensions/file-guard",
-    "/path/to/pi-packages/extensions/mcp-client",
-    "/path/to/pi-packages/extensions/workers"
+    "/path/to/pi-packages/dist/file-guard",
+    "/path/to/pi-packages/dist/mcp-client",
+    "/path/to/pi-packages/dist/workers",
+    "/path/to/pi-packages/dist/thinking-compression",
+    "/path/to/pi-packages/dist/gondolin"
   ]
 }
 ```
 
-The extension-specific runtime opt-ins must also be configured: enable File Guard in its config/environment, set `enabled: true` in `.pi/workers.json`, and set `enabled: true` in MCP Client configuration.
+The extension-specific runtime opt-ins must also be configured: enable File Guard in its config/environment, set `enabled: true` in `.pi/workers.json`, set `enabled: true` in MCP Client configuration, and set `enabled: true` in Gondolin Sandbox configuration (see [`gondolin.json.example`](gondolin.json.example)).

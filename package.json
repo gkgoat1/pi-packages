@@ -1,8 +1,18 @@
 {
   "name": "pi-packages",
   "version": "0.1.0",
-  "description": "Pi extensions for file guards, routed workers, configurable MCP clients, and thinking compression",
-  "keywords": ["pi-package", "pi", "mcp", "workers", "file-guard", "thinking-compression"],
+  "description": "Pi extensions for file guards, routed workers, configurable MCP clients, thinking compression, and a Gondolin micro-VM sandbox",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "mcp",
+    "workers",
+    "file-guard",
+    "thinking-compression",
+    "gondolin",
+    "sandbox",
+    "qemu"
+  ],
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -10,12 +20,15 @@
   },
   "scripts": {
     "check": "npx --yes --package typescript tsc --noEmit -p tsconfig.mcp.json",
-    "test": "node --import tsx --test"
+    "build": "node scripts/build.mjs",
+    "test": "node --import tsx --test",
+    "test:pi": "npm run build && node --test test/workers-bundle.test.mjs test/gondolin-bundle.test.mjs"
   },
-  "dependencies": {
+  "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "typescript": "^5.7.3",
-    "tsx": "^4.19.4"
+    "esbuild": "^0.28.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.7.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -25,10 +38,14 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/file-guard",
-      "./extensions/mcp-client",
-      "./extensions/workers",
-      "./extensions/thinking-compression"
+      "./dist/file-guard",
+      "./dist/mcp-client",
+      "./dist/workers",
+      "./dist/thinking-compression",
+      "./dist/gondolin"
     ]
+  },
+  "dependencies": {
+    "@earendil-works/gondolin": "^0.12.0"
   }
 }

@@ -1,0 +1,304 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+	DEFAULTS_PLACEHOLDER,
+	parseConfig,
+	mergeConfig,
+	envConfig,
+} from "../src/config.ts";
+import {
+	buildSecretDefinitions,
+	buildStubEnv,
+	discoverSecrets,
+	looksLikeSecretValue,
+	scrubValue,
+	sanitizeGuestEnv,
+} from "../src/secrets.ts";
+import type { RandomSource } from "../src/secrets.ts";
+import { GUEST_BASE_ENV, buildGuestEnv, toGuestPath } from "../src/ops.ts";
+import { createHttpHooks } from "@earendil-works/gondolin";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const fixedRandom: RandomSource = { hex: () => "0123456789abcdef" };
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+test("gondolin config is disabled by default", () => {
+	assert.equal(parseConfig({}).enabled, false);
+	assert.equal(parseConfig({ enabled: false }).enabled, false);
+	assert.equal(DEFAULTS_PLACEHOLDER().accel, "tcg");
+});
+
+test("gondolin accel defaults to tcg for nested VMs", () => {
+	const config = parseConfig({ enabled: true });
+	assert.equal(config.accel, "tcg");
+	assert.equal(config.httpProxy.enabled, true);
+	assert.equal(config.httpProxy.discoverKnownSecrets, true);
+	assert.deepEqual(config.allowedHosts, undefined);
+	assert.deepEqual(config.envPassthrough, []);
+});
+
+test("gondolin config validates and keeps explicit values", () => {
+	const config = parseConfig({
+		enabled: true,
+		accel: "hvf",
+		memory: "2G",
+		cpus: 4,
+		image: "alpine-base:latest",
+		allowedHosts: ["api.github.com"],
+		envPassthrough: ["LANG", "TZ"],
+		httpProxy: {
+			secrets: {
+				MY_SERVICE_TOKEN: { hosts: ["api.myservice.com"], envVar: "MY_SERVICE_TOKEN" },
+				INVALID: { hosts: [] },
+			},
+		},
+	});
+	assert.equal(config.accel, "hvf");
+	assert.equal(config.memory, "2G");
+	assert.equal(config.cpus, 4);
+	assert.equal(config.image, "alpine-base:latest");
+	assert.deepEqual(config.allowedHosts, ["api.github.com"]);
+	assert.deepEqual(config.envPassthrough, ["LANG", "TZ"]);
+	assert.deepEqual(Object.keys(config.httpProxy.secrets), ["MY_SERVICE_TOKEN"]);
+	assert.deepEqual(config.httpProxy.secrets.MY_SERVICE_TOKEN.hosts, ["api.myservice.com"]);
+});
+
+test("gondolin config layering merges secrets and honors env overrides", () => {
+	const global = parseConfig({
+		enabled: true,
+		httpProxy: { secrets: { A_KEY: { hosts: ["a.example"] }, B_KEY: { hosts: ["b.example"] } } },
+	});
+	const project = parseConfig({
+		enabled: true,
+		httpProxy: { secrets: { B_KEY: { hosts: ["b2.example"] } } },
+	});
+	const merged = mergeConfig(global, project);
+	assert.deepEqual(Object.keys(merged.httpProxy.secrets).sort(), ["A_KEY", "B_KEY"]);
+	assert.deepEqual(merged.httpProxy.secrets.B_KEY.hosts, ["b2.example"]);
+
+	const previous = { ...process.env };
+	try {
+		process.env.PI_GONDOLIN_ENABLED = "true";
+		const fromEnv = envConfig();
+		assert.equal(fromEnv.enabled, true);
+		assert.equal(fromEnv.accel, "tcg");
+		process.env.PI_GONDOLIN_ENABLED = "0";
+		assert.equal(envConfig().enabled, false);
+	} finally {
+		if ("PI_GONDOLIN_ENABLED" in process.env) delete process.env.PI_GONDOLIN_ENABLED;
+		process.env.PI_GONDOLIN_CONFIG = JSON.stringify({
+			enabled: true,
+			allowedHosts: ["*.internal"],
+			httpProxy: { secrets: { C_KEY: { hosts: ["c.example"] } } },
+		});
+		try {
+			const layered = envConfig();
+			assert.equal(layered.enabled, true);
+			assert.deepEqual(layered.allowedHosts, ["*.internal"]);
+			assert.deepEqual(layered.httpProxy.secrets.C_KEY.hosts, ["c.example"]);
+		} finally {
+			delete process.env.PI_GONDOLIN_CONFIG;
+			Object.assign(process.env, previous);
+		}
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Secret discovery
+// ---------------------------------------------------------------------------
+
+test("gondolin discovery finds known api keys and assigns stubs", () => {
+	const config = parseConfig({
+		enabled: true,
+		httpProxy: { secrets: { MY_TOKEN: { hosts: ["api.mine.dev"] } } },
+	});
+	const secrets = discoverSecrets(
+		{
+			ANTHROPIC_API_KEY: "sk-ant-real-key-value",
+			GITHUB_TOKEN: "ghp_realgithubtoken1234",
+			MY_TOKEN: "custom-secret-value-1",
+			OPENAI_API_KEY: "too short",
+			GROQ_API_KEY: "has whitespace inside",
+			DEEPSEEK_API_KEY: "changeme",
+		},
+		config,
+		fixedRandom,
+	);
+	assert.deepEqual(
+		secrets.map((s) => s.name),
+		["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "MY_TOKEN"],
+	);
+	const anthropic = secrets.find((s) => s.name === "ANTHROPIC_API_KEY")!;
+	assert.equal(anthropic.value, "sk-ant-real-key-value");
+	assert.deepEqual(anthropic.hosts, ["api.anthropic.com"]);
+	assert.equal(anthropic.placeholder, "gondolin-stub-ANTHROPIC_API_KEY-0123456789abcdef");
+	const custom = secrets.find((s) => s.name === "MY_TOKEN")!;
+	assert.deepEqual(custom.hosts, ["api.mine.dev"]);
+
+	// Stub env and secret definitions never leak real values.
+	const stubEnv = buildStubEnv(secrets);
+	assert.deepEqual(stubEnv, {
+		ANTHROPIC_API_KEY: "gondolin-stub-ANTHROPIC_API_KEY-0123456789abcdef",
+		GITHUB_TOKEN: "gondolin-stub-GITHUB_TOKEN-0123456789abcdef",
+		MY_TOKEN: "gondolin-stub-MY_TOKEN-0123456789abcdef",
+	});
+	assert.equal(JSON.stringify(stubEnv).includes("sk-ant-real-key-value"), false);
+	const definitions = buildSecretDefinitions(secrets);
+	assert.equal(definitions.ANTHROPIC_API_KEY.value, "sk-ant-real-key-value");
+	assert.equal(definitions.ANTHROPIC_API_KEY.placeholder, "gondolin-stub-ANTHROPIC_API_KEY-0123456789abcdef");
+});
+
+test("gondolin discovery respects config toggles", () => {
+	const disabled = parseConfig({ enabled: true, httpProxy: { enabled: false } });
+	assert.deepEqual(discoverSecrets({ ANTHROPIC_API_KEY: "sk-ant-real-key-value" }, disabled, fixedRandom), []);
+
+	const noCatalog = parseConfig({ enabled: true, httpProxy: { discoverKnownSecrets: false } });
+	assert.deepEqual(discoverSecrets({ ANTHROPIC_API_KEY: "sk-ant-real-key-value" }, noCatalog, fixedRandom), []);
+
+	// Custom secrets with a distinct envVar name still work without the catalog.
+	const customOnly = parseConfig({
+		enabled: true,
+		httpProxy: {
+			discoverKnownSecrets: false,
+			secrets: { SERVICE_KEY: { hosts: ["svc.example"], envVar: "SVC_PROD_KEY" } },
+		},
+	});
+	const secrets = discoverSecrets({ SVC_PROD_KEY: "svc-prod-secret-value" }, customOnly, fixedRandom);
+	assert.equal(secrets.length, 1);
+	assert.equal(secrets[0].name, "SERVICE_KEY");
+	assert.equal(secrets[0].envVar, "SVC_PROD_KEY");
+
+	// The extension's own config channel is never stubbed.
+	const weird = parseConfig({
+		enabled: true,
+		httpProxy: { discoverKnownSecrets: false, secrets: { PI_GONDOLIN_CONFIG: { hosts: ["x"] } } },
+	});
+	assert.deepEqual(discoverSecrets({ PI_GONDOLIN_CONFIG: "{\"enabled\":true}" }, weird, fixedRandom), []);
+});
+
+test("gondolin secret value heuristics reject sentinels", () => {
+	assert.equal(looksLikeSecretValue(undefined), false);
+	assert.equal(looksLikeSecretValue("short"), false);
+	assert.equal(looksLikeSecretValue("contains space value"), false);
+	assert.equal(looksLikeSecretValue("placeholder"), false);
+	assert.equal(looksLikeSecretValue("12345678"), true);
+});
+
+test("gondolin env sanitization scrubs real keys from passthrough values", () => {
+	const config = parseConfig({ enabled: true });
+	const secrets = discoverSecrets(
+		{
+			ANTHROPIC_API_KEY: "sk-ant-real-key-value",
+			GITHUB_TOKEN: "ghp_realgithubtoken1234",
+		},
+		config,
+		fixedRandom,
+	);
+	const env = {
+		// Embedded in a URL-style value
+		NPM_CONFIG_REGISTRY_AUTH: "https://user:sk-ant-real-key-value@registry.example/npm/",
+		LANG: "en_US.UTF-8",
+		ANTHROPIC_API_KEY: "sk-ant-real-key-value",
+	};
+	const guest = sanitizeGuestEnv(env, secrets, ["NPM_CONFIG_REGISTRY_AUTH", "LANG", "ANTHROPIC_API_KEY"]);
+	assert.equal(guest.ANTHROPIC_API_KEY, "gondolin-stub-ANTHROPIC_API_KEY-0123456789abcdef");
+	assert.equal(
+		guest.NPM_CONFIG_REGISTRY_AUTH,
+		"https://user:gondolin-stub-ANTHROPIC_API_KEY-0123456789abcdef@registry.example/npm/",
+	);
+	assert.equal(guest.LANG, "en_US.UTF-8");
+	// Values never in the passthrough list never reach the guest.
+	assert.equal("GITHUB_TOKEN" in guest, false);
+	assert.equal(JSON.stringify(guest).includes("ghp_realgithubtoken1234"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Guest env + path mapping
+// ---------------------------------------------------------------------------
+
+test("gondolin guest env is minimal and never copies host env wholesale", () => {
+	const env = buildGuestEnv({
+		hostEnv: { ...GUEST_BASE_ENV, HOST_ONLY: "leak", LANG: "en_US.UTF-8" },
+		secrets: [],
+		passthrough: ["LANG"],
+	});
+	assert.deepEqual(env, { LANG: "en_US.UTF-8" });
+	assert.equal("HOST_ONLY" in env, false);
+});
+
+test("gondolin path mapping escapes are rejected", () => {
+	assert.equal(toGuestPath("/work", "/work", "/workspace"), "/workspace");
+	assert.equal(toGuestPath("/work", "/work/src/a.ts", "/workspace"), "/workspace/src/a.ts");
+	assert.throws(() => toGuestPath("/work", "/etc/passwd", "/workspace"));
+	assert.throws(() => toGuestPath("/work", "/work/../secret", "/workspace"));
+});
+
+// ---------------------------------------------------------------------------
+// HTTP hook contract (real gondolin createHttpHooks engine)
+// ---------------------------------------------------------------------------
+
+test("gondolin http hooks inflate stubs to real keys only for allowed hosts", async () => {
+	const { httpHooks } = createHttpHooks({
+		secrets: {
+			TOK: { hosts: ["api.example.com"], value: "real-secret-value-123", placeholder: "gondolin-stub-TOK-aaaa" },
+		},
+	});
+	const auth = async (url: string, headers: Record<string, string>) => {
+		const result = await httpHooks.onRequest!(new Request(url, { headers }));
+		return (result as Request).headers.get("authorization");
+	};
+
+	// Stub to its allowed host is inflated back into the real credential.
+	assert.equal(await auth("https://api.example.com/v1", { Authorization: "Bearer gondolin-stub-TOK-aaaa" }), "Bearer real-secret-value-123");
+
+	// A real, non-stub API key passes through untouched.
+	assert.equal(await auth("https://api.example.com", { Authorization: "Bearer sk-real-other-key-xyz" }), "Bearer sk-real-other-key-xyz");
+
+	// A request with no credential passes through untouched.
+	assert.equal(await auth("https://example.com", {}), null);
+
+	// A stub sent to a host that is not its allowed host is blocked (defense in
+	// depth), so stubs never leak to arbitrary hosts.
+	await assert.rejects(
+		() => Promise.resolve(httpHooks.onRequest!(new Request("https://evil.example", { headers: { Authorization: "Bearer gondolin-stub-TOK-aaaa" } }))),
+		(err: unknown) => (err as { status?: number }).status === 403,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Extension factory (disabled state must stay completely inert)
+// ---------------------------------------------------------------------------
+
+test("gondolin extension leaves tools local while disabled", async () => {
+	delete process.env.PI_GONDOLIN_ENABLED;
+	delete process.env.PI_GONDOLIN_CONFIG;
+	const { default: gondolinExtension } = await import("../index.ts");
+
+	const tools = new Map<string, { name: string; execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }> }>();
+	const pi = {
+		on: () => {},
+		registerCommand: () => {},
+		registerTool: (tool: { name: string }) => tools.set(tool.name, tool as never),
+	} as unknown as ExtensionAPI;
+	gondolinExtension(pi);
+	assert.deepEqual([...tools.keys()].sort(), ["bash", "edit", "read", "write"]);
+
+	// A local read must succeed without any VM boot attempt (booting would
+	// download a guest image or fail on missing QEMU, so this stays fast only
+	// if the disabled path truly delegates to the local tool).
+	const directory = await mkdtemp(join(tmpdir(), "pi-gondolin-disabled-"));
+	try {
+		const file = join(directory, "note.txt");
+		await writeFile(file, "local content");
+		const result = await tools.get("read")!.execute("t1", { path: file });
+		assert.equal(result.content[0]?.text.includes("local content"), true);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});

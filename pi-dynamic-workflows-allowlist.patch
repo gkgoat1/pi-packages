@@ -1,0 +1,322 @@
+diff --git a/README.md b/README.md
+index 7080e7e..20cd335 100644
+--- a/README.md
++++ b/README.md
+@@ -313,7 +313,7 @@ Library API note: the unused `createSharedStoreTools` export was removed — use
+ 
+ Two behavior changes to know about:
+ 
+-- **Subagents no longer load host extensions by default.** Each run now builds one shared, extension-free resource loader for all of its subagents (a memory-leak mitigation). Skills, prompts, and `AGENTS.md` context still load, and the coding tools and any toolset (e.g. `web-research`) you hand a subagent are unaffected. What subagents lose is **host-extension-registered tools** — MCP bridges, browser tools, or anything else another installed extension adds. If an `agentType` names one of those tools in its allowlist, that entry now matches nothing. This also means a subagent can no longer recurse into another orchestration extension, even one not covered by the existing tool denylist.
++- **Host extensions are disabled by default, but you can allowlist them.** Each run still shares one resource loader; configure `enabledSubagentExtensions` in `~/.pi/workflows/settings.json` with package names (for example `pi-blackhole` or `neuralyzer`) or package-relative extension directories (for example `mcp-client`) to re-enable only those host extensions. The workflow's own `workflow` and `workflow_control` tools remain denied to subagents.
+ - **Checkpoints persisted before this release re-run once.** `checkpoint()`'s resume-identity hash now also covers `default`, `headless`, and `timeoutMs`, so changing any of them between runs correctly invalidates a stale cached answer. This is a one-time effect: any checkpoint cached under the old hash simply re-prompts once and then caches normally again.
+ 
+ ## Development
+diff --git a/extensions/workflow.ts b/extensions/workflow.ts
+index 5e6dfae..b16f914 100644
+--- a/extensions/workflow.ts
++++ b/extensions/workflow.ts
+@@ -46,6 +46,7 @@ export default function extension(pi: ExtensionAPI) {
+     },
+     // On top of the always-on workflow/workflow_control denial in subagents
+     // (#107), let users block additional recursive-orchestration tools.
++    enabledSubagentExtensions: settings.enabledSubagentExtensions,
+     excludeSubagentTools: settings.excludeSubagentTools,
+     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+     defaultTokenBudget: settings.defaultTokenBudget ?? null,
+diff --git a/src/agent.ts b/src/agent.ts
+index b13cdcf..9f10455 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -232,6 +232,11 @@ export interface WorkflowAgentOptions {
+    * that are only available via extension registration.
+    */
+   modelRegistry?: ModelRegistry;
++  /**
++   * Package-source/name or package-relative-directory identifiers for host
++   * extensions that subagents may load. Omitted/empty means no host extensions.
++   */
++  enabledExtensions?: string[];
+   /**
+    * Persist each subagent transcript as a real pi session file under the
+    * standard sessions directory (keyed by the runner's project cwd), instead
+@@ -520,12 +525,33 @@ export function subagentExcludedTools(extra?: string[], sessionExclude?: string[
+   return [...DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ...(sessionExclude ?? []), ...(extra ?? [])];
+ }
+ 
++/** Match an allowlist identifier against Pi's extension source metadata. */
++export function matchesEnabledExtension(
++  extension: { path: string; sourceInfo: { source?: string; baseDir?: string } },
++  enabledExtensions: string[],
++): boolean {
++  if (!enabledExtensions.length) return false;
++  const source = extension.sourceInfo.source ?? "";
++  const baseDir = extension.sourceInfo.baseDir ?? "";
++  return enabledExtensions.some((identifier) => {
++    const normalized = identifier.trim();
++    if (!normalized) return false;
++    if (source === normalized || source === `npm:${normalized}` || source.endsWith(`/${normalized}`)) return true;
++    return (
++      extension.path.startsWith(`${baseDir}/${normalized}/`) ||
++      extension.path.startsWith(`${baseDir}/${normalized}.`) ||
++      extension.path.startsWith(`${baseDir}/extensions/${normalized}/`)
++    );
++  });
++}
++
+ export class WorkflowAgent {
+   private readonly cwd: string;
+   private readonly baseTools: ToolDefinition[];
+   /** Extra subagent tool-name denylist, merged with the always-on defaults. */
+   private readonly excludeTools: string[];
+   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
++  private readonly enabledExtensions: string[];
+   private readonly persistAgentSessions: boolean;
+   private readonly instructions?: string;
+   private readonly mainModel?: string;
+@@ -559,6 +585,7 @@ export class WorkflowAgent {
+     this.baseTools = options.tools ?? createCodingTools(this.cwd);
+     this.excludeTools = options.excludeTools ?? [];
+     this.sessionOptions = options.session ?? {};
++    this.enabledExtensions = options.enabledExtensions ?? [];
+     this.persistAgentSessions = options.persistAgentSessions ?? false;
+     this.instructions = options.instructions;
+     this.mainModel = options.mainModel;
+@@ -568,27 +595,8 @@ export class WorkflowAgent {
+   /**
+    * A resource loader shared by every subagent of this run, built once (#109).
+    *
+-   * Without a resourceLoader, createAgentSession() builds a fresh
+-   * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
+-   * extension factory each time (verified: N subagents → N factory runs). Each
+-   * such factory that arms a load-time timer/listener then roots its subagent
+-   * session forever, because AgentSession.dispose() emits no session_shutdown to
+-   * run the cleanup — the dominant #109 leak, and one our own extension
+-   * (UsageLimitScheduler) can trigger.
+-   *
+-   * `noExtensions: true` skips loading host extensions; skills, prompts, and
+-   * AGENTS.md context still load. The subagent keeps the tools this workflow
+-   * hands it via `customTools` (coding tools + any toolset like web-research) —
+-   * those are unaffected. What it loses is HOST EXTENSION-REGISTERED tools (MCP
+-   * bridges, browser tools, anything a host extension added via ctx.registerTool):
+-   * pre-change a subagent session inherited those from the full host extension
+-   * set, now it does not, so an agentType `tools` allowlist naming one matches
+-   * nothing. This is a deliberate trade-off — it also structurally kills recursive
+-   * orchestration in subagents (no extension runtime at all), beyond the name-level
+-   * #107 denylist — and must be release-noted. `createAgentSession` with a shared
+-   * resourceLoader is a supported embedding pattern. runWorkflow builds one
+-   * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
+-   * once, reused by all its subagents, then dropped with the agent.
++   * Host extensions are disabled by default. A small allowlist can opt selected
++   * entries back in without running the rest of the host's extension factories.
+    */
+   private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
+     if (!this.sharedResourceLoaderPromise) {
+@@ -597,7 +605,12 @@ export class WorkflowAgent {
+           cwd: this.cwd,
+           agentDir,
+           settingsManager: SettingsManager.create(this.cwd, agentDir),
+-          noExtensions: true,
++          extensionsOverride: (base) => ({
++            ...base,
++            extensions: base.extensions.filter((extension) =>
++              matchesEnabledExtension(extension, this.enabledExtensions),
++            ),
++          }),
+         });
+         await loader.reload();
+         return loader;
+diff --git a/src/workflow-manager.ts b/src/workflow-manager.ts
+index d3164c6..4b5b60b 100644
+--- a/src/workflow-manager.ts
++++ b/src/workflow-manager.ts
+@@ -201,6 +201,8 @@ export interface WorkflowManagerOptions {
+    * to the default coding tools.
+    */
+   toolsets?: Record<string, () => ToolDefinition[]>;
++  /** Allowlisted host extensions that workflow subagents may load. */
++  enabledSubagentExtensions?: string[];
+   /**
+    * Extra tool NAMES to deny in every subagent session, on top of the always-on
+    * `workflow`/`workflow_control` defaults (see DEFAULT_EXCLUDED_SUBAGENT_TOOLS).
+@@ -234,6 +236,7 @@ export type WorkflowManagerReloadOptions = Pick<
+   | "defaultAgentRetries"
+   | "defaultTokenBudget"
+   | "toolsets"
++  | "enabledSubagentExtensions"
+   | "excludeSubagentTools"
+   | "persistAgentSessions"
+ >;
+@@ -328,6 +331,7 @@ export class WorkflowManager extends EventEmitter {
+   private defaultAgentRetries: number;
+   private defaultTokenBudget: number | null;
+   private toolsets?: Record<string, () => ToolDefinition[]>;
++  private enabledSubagentExtensions?: string[];
+   private excludeSubagentTools?: string[];
+   private persistAgentSessions: boolean;
+ 
+@@ -344,6 +348,7 @@ export class WorkflowManager extends EventEmitter {
+     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
+     this.toolsets = options.toolsets;
++    this.enabledSubagentExtensions = options.enabledSubagentExtensions;
+     this.excludeSubagentTools = options.excludeSubagentTools;
+     this.persistAgentSessions = options.persistAgentSessions ?? false;
+     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
+@@ -394,6 +399,7 @@ export class WorkflowManager extends EventEmitter {
+     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
+     this.toolsets = options.toolsets;
++    this.enabledSubagentExtensions = options.enabledSubagentExtensions;
+     this.excludeSubagentTools = options.excludeSubagentTools;
+     this.persistAgentSessions = options.persistAgentSessions ?? false;
+   }
+@@ -656,6 +662,7 @@ export class WorkflowManager extends EventEmitter {
+         agentTimeoutMs: resolvedAgentTimeoutMs,
+         tokenBudget: resolvedTokenBudget,
+         tools: resolvedTools,
++        enabledExtensions: this.enabledSubagentExtensions,
+         excludeTools: this.excludeSubagentTools,
+         confirm,
+         loadSavedWorkflow: this.loadSavedWorkflow,
+diff --git a/src/workflow-settings.ts b/src/workflow-settings.ts
+index 71809ad..af8c064 100644
+--- a/src/workflow-settings.ts
++++ b/src/workflow-settings.ts
+@@ -42,6 +42,13 @@ export interface WorkflowSettings {
+    * `summary`/`synthesis` fields are never truncated.
+    */
+   deliveredResultMaxChars?: number;
++  /**
++   * Extension identifiers that workflow subagents may load. Omitted or empty
++   * keeps host extensions disabled (the safe default). Identifiers match a
++   * package source/name (for example `pi-blackhole` or `neuralyzer`) or a
++   * package-relative extension directory (for example `mcp-client`).
++   */
++  enabledSubagentExtensions?: string[];
+   /**
+    * Extra tool names to deny in workflow subagent sessions, on top of the
+    * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
+@@ -171,6 +178,12 @@ function normalizeSettings(value: unknown): WorkflowSettings {
+   }
+   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
+   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
++  if (Array.isArray(raw.enabledSubagentExtensions)) {
++    const identifiers = raw.enabledSubagentExtensions.filter(
++      (identifier): identifier is string => typeof identifier === "string" && identifier.trim().length > 0,
++    );
++    if (identifiers.length) settings.enabledSubagentExtensions = identifiers;
++  }
+   if (Array.isArray(raw.excludeSubagentTools)) {
+     const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
+     if (names.length) settings.excludeSubagentTools = names;
+diff --git a/tests/agent.test.ts b/tests/agent.test.ts
+index 51354d8..64e9445 100644
+--- a/tests/agent.test.ts
++++ b/tests/agent.test.ts
+@@ -10,6 +10,7 @@ import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
+ import {
+   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+   listAvailableModelSpecs,
++  matchesEnabledExtension,
+   resolveAgentModelSpec,
+   subagentExcludedTools,
+   usageFromStats,
+@@ -23,6 +24,7 @@ import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
+ 
+ // Private methods used for testing - cast to this type to access them without `any`
+ type WorkflowAgentPrivates = {
++  getSharedResourceLoader(agentDir: string): Promise<{ getExtensions(): { extensions: Array<{ path: string }> } }>;
+   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
+   lastAssistantText(messages: unknown[]): string;
+   finalAssistantText(messages: unknown[]): string;
+@@ -578,19 +580,54 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
+   assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
+ });
+ 
+-test("the subagent resource loader is built once per run and shared across subagents (#109)", () => {
+-  // The #109 mitigation: one no-extensions loader per run, reused by every
+-  // subagent, instead of createAgentSession re-running every extension factory
+-  // (and rooting each disposed session) per subagent. Memoization is the invariant.
++test("the subagent resource loader is built once per run and keeps host extensions disabled by default (#109)", async () => {
+   const agent = new WorkflowAgent({ cwd: "/tmp" });
+-  type Priv = { getSharedResourceLoader(agentDir: string): Promise<unknown> };
+-  const a = agent as unknown as Priv;
+-  const first = a.getSharedResourceLoader("/tmp/agentdir");
+-  const second = a.getSharedResourceLoader("/tmp/agentdir");
++  const first = agent.getSharedResourceLoader("/tmp/agentdir");
++  const second = agent.getSharedResourceLoader("/tmp/agentdir");
+   assert.equal(first, second, "same promise — the loader is built once and shared, not rebuilt per subagent");
+-  // reload() may reject in a bare temp dir; we only assert memoization here.
+-  first.catch(() => {});
+-  second.catch(() => {});
++  const loader = await first;
++  assert.deepEqual(loader.getExtensions().extensions, [], "the default must not load host extensions");
++});
++
++test("the subagent extension allowlist matches package sources and package-relative directories", () => {
++  const allowlist = ["neuralyzer", "pi-dynamic-workflows", "dist", "mcp-client", "pi-blackhole"];
++  const extension = (path: string, source: string, baseDir: string) => ({ path, sourceInfo: { source, baseDir } });
++  assert.ok(
++    matchesEnabledExtension(
++      extension("/npm/pi-neuralyzer/dist/index.js", "npm:@gintasz/pi-neuralyzer", "/npm/pi-neuralyzer"),
++      allowlist,
++    ),
++  );
++  assert.ok(
++    matchesEnabledExtension(
++      extension(
++        "/npm/pi-dynamic-workflows/extensions/workflow.ts",
++        "npm:@quintinshaw/pi-dynamic-workflows",
++        "/npm/pi-dynamic-workflows",
++      ),
++      allowlist,
++    ),
++  );
++  assert.ok(matchesEnabledExtension(extension("/local/dist/index.ts", "local", "/local"), allowlist));
++  assert.ok(matchesEnabledExtension(extension("/local/mcp-client/index.ts", "local", "/local"), allowlist));
++  assert.ok(
++    matchesEnabledExtension(
++      extension("/npm/pi-blackhole/dist/index.js", "npm:pi-blackhole", "/npm/pi-blackhole"),
++      allowlist,
++    ),
++  );
++  assert.ok(
++    !matchesEnabledExtension(
++      extension("/npm/pi-provider-kimi-code/index.ts", "npm:pi-provider-kimi-code", "/npm/pi-provider-kimi-code"),
++      allowlist,
++    ),
++  );
++  assert.ok(
++    !matchesEnabledExtension(
++      extension("/git/minimalcc-pi/index.ts", "git:github.com/5omeOtherGuy/minimalcc-pi", "/git/minimalcc-pi"),
++      allowlist,
++    ),
++  );
+ });
+ 
+ // ═══════════════════════════════════════════════════════════════════════
+diff --git a/tests/workflow-settings.test.ts b/tests/workflow-settings.test.ts
+index a0bc0a1..4026eb1 100644
+--- a/tests/workflow-settings.test.ts
++++ b/tests/workflow-settings.test.ts
+@@ -90,6 +90,20 @@ describe("workflow settings", () => {
+     });
+   });
+ 
++  it("loads and normalizes enabledSubagentExtensions, dropping non-string/blank entries", () => {
++    const settingsPath = join(tmpdir(), `pi-dw-settings-${Date.now()}-${Math.random()}.json`);
++    try {
++      writeFileSync(
++        settingsPath,
++        JSON.stringify({ enabledSubagentExtensions: ["neuralyzer", 42, "", "  ", "mcp-client"] }),
++        "utf-8",
++      );
++      assert.deepEqual(loadWorkflowSettings(settingsPath), { enabledSubagentExtensions: ["neuralyzer", "mcp-client"] });
++    } finally {
++      rmSync(settingsPath, { force: true });
++    }
++  });
++
+   it("loads and normalizes excludeSubagentTools, dropping non-string/blank entries (#107)", () => {
+     withSettingsPath((settingsPath) => {
+       mkdirSync(dirname(settingsPath), { recursive: true });
