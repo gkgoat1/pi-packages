@@ -15,7 +15,7 @@ Adapted from [pasky/pi-gondolin](https://github.com/pasky/pi-gondolin) (MIT) wit
 
 ## Enable
 
-Set `"enabled": true` in `~/.pi/agent/gondolin.json` (global) or `.pi/gondolin.json` (trusted projects), or `PI_GONDOLIN_ENABLED=true`. Start from [`examples/gondolin.json.example`](../../examples/gondolin.json.example).
+Set `"enabled": true` in `~/.pi/agent/gondolin.json` (global) or `.pi/gondolin.json` (trusted projects), or `PI_GONDOLIN_ENABLED=force`. Start from [`examples/gondolin.json.example`](../../examples/gondolin.json.example).
 
 ```json
 {
@@ -23,7 +23,7 @@ Set `"enabled": true` in `~/.pi/agent/gondolin.json` (global) or `.pi/gondolin.j
 }
 ```
 
-That is enough for the defaults: `tcg` acceleration, `/workspace` mount, HTTP proxying on, well-known API keys discovered from the environment.
+That is enough for the defaults: `tcg` acceleration, `/workspace` mount, the global skills directory mounted read-only, HTTP proxying on, well-known API keys discovered from the environment.
 
 ## What it does
 
@@ -31,6 +31,44 @@ That is enough for the defaults: `tcg` acceleration, `/workspace` mount, HTTP pr
 - **Routes `!` commands** — user shell commands also run in the VM (fail closed: they wait for the VM rather than falling back to the host).
 - **Patches the system prompt** — the LLM is told its cwd is `/workspace` and that `gondolin-stub-*` values are sandbox stubs.
 - **Fail-fast lifecycle** — the VM boots eagerly on `session_start` so missing QEMU or download failures surface immediately; it closes on `session_shutdown`.
+
+## Extra mounts (skills and other host folders)
+
+The host working directory is always mounted read-write at `guestWorkspace`. Additional host folders can be mounted into the guest — read-only by default — through the `mounts` map:
+
+```json
+{
+  "enabled": true,
+  "mounts": {
+    "skills": "ro",
+    "~/reference-docs": { "access": "rw", "guestPath": "/docs" }
+  }
+}
+```
+
+- Keys are host paths (`~` expanded), absolute paths, or the alias `skills` for `~/.pi/agent/skills`.
+- Values are `"ro"` (writes fail with `EROFS`), `"rw"`, or `{ "access": …, "guestPath": … }`. Guest paths default to `/mnt/<name>` (skills: `/root/.pi/agent/skills`, so `$HOME`-relative skill paths resolve naturally — the guest `HOME` is `/root`).
+- With no `mounts` key anywhere, the default is exactly the global skills directory, read-only, and nothing else. Listing `mounts` **replaces** that default.
+- Mounts also flow through the guardable provider used by File Guard's interception mode: writes to read-write extras are mediated, and the system prompt tells the agent the host↔guest path mapping.
+
+**Capability ceiling**: the *global* config (or env) defines the maximum — which host folders may be mounted and at what access. Repo config can only restrict: drop a mount (omit it) or downgrade `rw` → `ro`. A repo can never add a host folder the global config did not grant, and a `rw` request under a `ro` ceiling is clamped to `ro`. This holds for trusted and untrusted repos alike.
+
+## Who may configure what
+
+Layering: `defaults` ← global (`~/.pi/agent/gondolin.json`) ← repo (`.pi/gondolin.json`) ← environment.
+
+| Layer | Authority |
+| --- | --- |
+| **global** | Full override; sets the capability ceiling (mounts, credentials, egress). |
+| **repo, trusted** | Full override for the whole surface *except mounts*, which only restrict the global ceiling. |
+| **repo, untrusted** | Restrict-only: may disable the HTTP proxy, narrow `allowedHosts` / `envPassthrough` / credential hosts, remove credentials, and restrict mounts. Cannot change `enabled` or any preference (`accel`, `memory`, `image`, …), because the agent itself can write that file. |
+| **env** | Unconditional. The user typed it when launching Pi; a malicious agent cannot change the environment of the running process without being detected. |
+
+Environment variables:
+
+- `PI_GONDOLIN_ENABLED=force` — force-enable the VM, even over a disabled global config (aliases: `true`, `1`).
+- `PI_GONDOLIN_ENABLED=dangerously-force-disable` — disable the VM regardless of file config (aliases: `false`, `0`). Unset or unrecognized values leave enablement to the files.
+- `PI_GONDOLIN_CONFIG` — a JSON config object applied as the top layer (may include `mounts`, replacing the ceiling).
 
 ## Credential stubs and the HTTP proxy
 
@@ -54,13 +92,14 @@ Outbound HTTP from the guest is intercepted by the host-side proxy. Discovery wo
 
 ## Configuration reference
 
-Layering: `~/.pi/agent/gondolin.json` ← trusted `.pi/gondolin.json` ← `PI_GONDOLIN_CONFIG` (JSON); `PI_GONDOLIN_ENABLED` overrides the flag.
+See "Who may configure what" above for the layering rules.
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `enabled` | `false` | Explicit opt-in. |
 | `accel` | `"tcg"` | QEMU acceleration backend. `tcg` = software emulation (nested-VM safe). |
 | `guestWorkspace` | `"/workspace"` | Guest mount point for the host working directory. |
+| `mounts` | skills dir as `ro` | Extra host folders: `host path → "ro" \| "rw" \| { access, guestPath }`. Global/env layers set the ceiling; repo layers can only restrict. |
 | `memory` | gondolin default (`1G`) | VM memory (QEMU syntax). |
 | `cpus` | gondolin default | VM cpu count. |
 | `image` | latest `alpine-base` | Guest image selector or asset directory. |
@@ -69,7 +108,7 @@ Layering: `~/.pi/agent/gondolin.json` ← trusted `.pi/gondolin.json` ← `PI_GO
 | `envPassthrough` | `[]` | Host env var names copied into the guest after secret scrubbing (e.g. `["TZ", "HTTP_PROXY"]`). |
 | `httpProxy.enabled` | `true` | Set `false` to run without HTTP hooks or stubs. |
 | `httpProxy.discoverKnownSecrets` | `true` | Disable to stub only `httpProxy.secrets` entries. |
-| `httpProxy.secrets` | `{}` | Custom credentials: `name → { hosts, envVar? }`. |
+| `httpProxy.secrets` | `{}` | Custom credentials: `name → { hosts, envVar? }` (`"hosts": []` removes the credential). |
 
 ## Shared VM handle (for the other extensions in this package)
 
@@ -82,21 +121,24 @@ interface GondolinShared {
 	readonly version: 1;          // contract version
 	readonly hostCwd: string;     // host directory mounted in the guest
 	readonly guestWorkspace: string;
+	readonly mounts: readonly { hostPath: string; guestPath: string; access: "ro" | "rw" }[];
 	isEnabled(): boolean;
 	refreshTrust(isProjectTrusted: boolean): boolean;
 	ensureVm(): Promise<unknown>; // boot (or return) the VM
 	getVm(): unknown;
-	toGuestPath(hostPath: string): string | undefined;
+	toGuestPath(hostPath: string): string | undefined; // workspace or extra mounts
 	registerFsGuard(guard: GondolinFsGuard): () => void; // returns unregister
 	execGuest(spec: GuestExecSpec): GuestProcess;
 }
 ```
 
 - **`registerFsGuard`** adds a `before`/`after` hook on every filesystem
-  operation against the mounted host workspace. Returning a decision from
-  `before` denies the operation (`EACCES` inside the guest). Guards are
-  consulted dynamically, so they can be registered before or after the VM
-  boots. This is [File Guard](../file-guard)'s interception mode.
+  operation against the mounted host workspace **and every extra mount**.
+  Returning a decision from `before` denies the operation (`EACCES` inside the
+  guest). Guards are consulted dynamically, so they can be registered before
+  or after the VM boots. This is [File Guard](../file-guard)'s interception
+  mode; read-only extra mounts hard-block writes with `EROFS` before guards
+  run.
 - **`execGuest`** starts a long-running process inside the VM with piped
   stdio. The guest env is the minimal base plus credential stubs; env values
   matching discovered secrets are stubbed so real keys stay host-side (the

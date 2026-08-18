@@ -8,12 +8,13 @@ import {
   createReadTool,
   createWriteTool
 } from "@earendil-works/pi-coding-agent";
+import { existsSync as existsSync3 } from "node:fs";
 import { VM, createHttpHooks } from "@earendil-works/gondolin";
 
 // extensions/gondolin/src/config.ts
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 var DEFAULTS = {
   enabled: false,
@@ -24,8 +25,26 @@ var DEFAULTS = {
     enabled: true,
     discoverKnownSecrets: true,
     secrets: {}
-  }
+  },
+  mounts: []
 };
+var SKILLS_GUEST_PATH = "/root/.pi/agent/skills";
+function defaultMounts(home = homedir()) {
+  return [
+    {
+      hostPath: join(home, ".pi", "agent", "skills"),
+      access: "ro",
+      guestPath: SKILLS_GUEST_PATH
+    }
+  ];
+}
+function withDefaults() {
+  return {
+    ...DEFAULTS,
+    httpProxy: { ...DEFAULTS.httpProxy, secrets: {} },
+    mounts: defaultMounts()
+  };
+}
 function asObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
 }
@@ -36,109 +55,227 @@ function parseSecretSpec(value) {
   const object = asObject(value);
   if (!object) return void 0;
   const hosts = asStringArray(object.hosts);
-  if (!hosts || hosts.length === 0) return void 0;
+  if (!hosts) return void 0;
+  if (hosts.length === 0) return null;
   const spec = { hosts };
   if (typeof object.envVar === "string" && object.envVar) spec.envVar = object.envVar;
   return spec;
 }
-function parseHttpProxy(value) {
-  const object = asObject(value);
-  if (!object) return void 0;
-  const secrets = {};
-  const secretMap = asObject(object.secrets);
-  if (secretMap) {
-    for (const [name, raw] of Object.entries(secretMap)) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-      const spec = parseSecretSpec(raw);
-      if (spec) secrets[name] = spec;
-    }
-  }
-  return {
-    enabled: typeof object.enabled === "boolean" ? object.enabled : true,
-    discoverKnownSecrets: typeof object.discoverKnownSecrets === "boolean" ? object.discoverKnownSecrets : true,
-    secrets
-  };
+function normalizeHostKey(key, home) {
+  if (key === "skills") return join(home, ".pi", "agent", "skills");
+  if (key === "~") return home;
+  if (key.startsWith("~/")) return join(home, key.slice(2));
+  if (key.startsWith("/")) return key;
+  return void 0;
 }
-function parseConfig(value) {
+function normalizeGuestPath(value, hostPath, home) {
+  let guestPath;
+  if (typeof value === "string" && value.startsWith("/")) guestPath = value;
+  if (!guestPath) {
+    guestPath = hostPath === join(home, ".pi", "agent", "skills") ? SKILLS_GUEST_PATH : `/mnt/${basename(hostPath)}`;
+  }
+  const segments = [];
+  for (const segment of guestPath.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") return void 0;
+    segments.push(segment);
+  }
+  if (segments.length === 0) return void 0;
+  return `/${segments.join("/")}`;
+}
+function parseMountsValue(raw) {
+  const object = asObject(raw);
+  if (!object) return [];
+  const home = homedir();
+  const byHost = /* @__PURE__ */ new Map();
+  for (const [key, value] of Object.entries(object)) {
+    const hostPath = normalizeHostKey(key, home);
+    if (!hostPath) continue;
+    let access;
+    let guestRaw;
+    if (value === "ro" || value === "rw") access = value;
+    else if (asObject(value)) {
+      const accessRaw = asObject(value)?.access;
+      if (accessRaw === "ro" || accessRaw === "rw") access = accessRaw;
+      else continue;
+      guestRaw = asObject(value)?.guestPath;
+    } else continue;
+    const guestPath = normalizeGuestPath(guestRaw, hostPath, home);
+    if (!guestPath) continue;
+    byHost.set(hostPath, { hostPath, access, guestPath });
+  }
+  const mounts = [];
+  for (const entry of byHost.values()) {
+    const clash = mounts.findIndex((existing) => existing.guestPath === entry.guestPath);
+    if (clash >= 0) mounts.splice(clash, 1);
+    mounts.push(entry);
+  }
+  return mounts;
+}
+function parseLayer(value) {
   const root = asObject(value);
-  if (!root || root.enabled !== true) return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-  const httpProxy = parseHttpProxy(root.httpProxy) ?? {
-    enabled: true,
-    discoverKnownSecrets: true,
-    secrets: {}
-  };
-  const config = {
-    enabled: true,
-    accel: typeof root.accel === "string" && root.accel ? root.accel : DEFAULTS.accel,
-    guestWorkspace: typeof root.guestWorkspace === "string" && root.guestWorkspace ? root.guestWorkspace : DEFAULTS.guestWorkspace,
-    envPassthrough: asStringArray(root.envPassthrough) ?? DEFAULTS.envPassthrough,
-    httpProxy
-  };
-  if (typeof root.memory === "string" && root.memory) config.memory = root.memory;
-  if (Number.isInteger(root.cpus) && root.cpus > 0) config.cpus = root.cpus;
-  if (typeof root.image === "string" && root.image) config.image = root.image;
+  if (!root) return {};
+  const layer = {};
+  if (typeof root.enabled === "boolean") layer.enabled = root.enabled;
+  if (typeof root.accel === "string" && root.accel) layer.accel = root.accel;
+  if (typeof root.guestWorkspace === "string" && root.guestWorkspace.startsWith("/")) {
+    layer.guestWorkspace = root.guestWorkspace;
+  }
+  if (typeof root.memory === "string" && root.memory) layer.memory = root.memory;
+  if (Number.isInteger(root.cpus) && root.cpus > 0) layer.cpus = root.cpus;
+  if (typeof root.image === "string" && root.image) layer.image = root.image;
   if (Number.isInteger(root.startTimeoutMs) && root.startTimeoutMs >= 0) {
-    config.startTimeoutMs = root.startTimeoutMs;
+    layer.startTimeoutMs = root.startTimeoutMs;
   }
   const allowedHosts = asStringArray(root.allowedHosts);
-  if (allowedHosts) config.allowedHosts = allowedHosts;
-  return config;
-}
-function readConfigFile(path4) {
-  if (!existsSync(path4)) return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-  try {
-    return parseConfig(JSON.parse(readFileSync(path4, "utf8")));
-  } catch {
-    return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-  }
-}
-function mergeSecrets(base, next) {
-  return { ...base, ...next };
-}
-function mergeConfig(base, next) {
-  return {
-    enabled: next.enabled ?? base.enabled,
-    accel: next.accel ?? base.accel,
-    guestWorkspace: next.guestWorkspace ?? base.guestWorkspace,
-    memory: next.memory ?? base.memory,
-    cpus: next.cpus ?? base.cpus,
-    image: next.image ?? base.image,
-    startTimeoutMs: next.startTimeoutMs ?? base.startTimeoutMs,
-    allowedHosts: next.allowedHosts ?? base.allowedHosts,
-    envPassthrough: next.envPassthrough.length > 0 ? next.envPassthrough : base.envPassthrough,
-    httpProxy: {
-      enabled: next.httpProxy.enabled && base.httpProxy.enabled,
-      discoverKnownSecrets: next.httpProxy.discoverKnownSecrets && base.httpProxy.discoverKnownSecrets,
-      secrets: mergeSecrets(base.httpProxy.secrets, next.httpProxy.secrets)
+  if (allowedHosts) layer.allowedHosts = allowedHosts;
+  const envPassthrough = asStringArray(root.envPassthrough);
+  if (envPassthrough) layer.envPassthrough = envPassthrough;
+  const proxy = asObject(root.httpProxy);
+  if (proxy) {
+    const parsed = {};
+    if (typeof proxy.enabled === "boolean") parsed.enabled = proxy.enabled;
+    if (typeof proxy.discoverKnownSecrets === "boolean") {
+      parsed.discoverKnownSecrets = proxy.discoverKnownSecrets;
     }
-  };
+    const secretMap = asObject(proxy.secrets);
+    if (secretMap) {
+      const secrets = {};
+      for (const [name, raw] of Object.entries(secretMap)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+        const spec = parseSecretSpec(raw);
+        if (spec !== void 0) secrets[name] = spec;
+      }
+      parsed.secrets = secrets;
+    }
+    if (Object.keys(parsed).length > 0) layer.httpProxy = parsed;
+  }
+  if (root.mounts !== void 0) {
+    layer.mounts = parseMountsValue(root.mounts);
+    layer.mountsExplicit = true;
+  }
+  return layer;
 }
-function parseBool(value) {
+function cloneConfig(base) {
+  return { ...base, httpProxy: { ...base.httpProxy, secrets: { ...base.httpProxy.secrets } } };
+}
+function applyOverride(base, layer) {
+  const next = cloneConfig(base);
+  if (layer.enabled !== void 0) next.enabled = layer.enabled;
+  if (layer.accel) next.accel = layer.accel;
+  if (layer.guestWorkspace) next.guestWorkspace = layer.guestWorkspace;
+  if (layer.memory) next.memory = layer.memory;
+  if (layer.cpus !== void 0) next.cpus = layer.cpus;
+  if (layer.image) next.image = layer.image;
+  if (layer.startTimeoutMs !== void 0) next.startTimeoutMs = layer.startTimeoutMs;
+  if (layer.allowedHosts) next.allowedHosts = [...layer.allowedHosts];
+  if (layer.envPassthrough) next.envPassthrough = [...layer.envPassthrough];
+  if (layer.httpProxy) {
+    if (layer.httpProxy.enabled !== void 0) next.httpProxy.enabled = layer.httpProxy.enabled;
+    if (layer.httpProxy.discoverKnownSecrets !== void 0) {
+      next.httpProxy.discoverKnownSecrets = layer.httpProxy.discoverKnownSecrets;
+    }
+    if (layer.httpProxy.secrets) {
+      for (const [name, spec] of Object.entries(layer.httpProxy.secrets)) {
+        if (spec === null) delete next.httpProxy.secrets[name];
+        else next.httpProxy.secrets[name] = { hosts: [...spec.hosts], ...spec.envVar ? { envVar: spec.envVar } : {} };
+      }
+    }
+  }
+  if (layer.mountsExplicit) next.mounts = layer.mounts ? layer.mounts.map((m) => ({ ...m })) : [];
+  return next;
+}
+function applyRestricting(base, layer) {
+  const next = cloneConfig(base);
+  if (layer.allowedHosts) {
+    next.allowedHosts = base.allowedHosts ? layer.allowedHosts.filter((host) => base.allowedHosts.includes(host)) : [...layer.allowedHosts];
+  }
+  if (layer.envPassthrough) {
+    const requested = new Set(layer.envPassthrough);
+    next.envPassthrough = base.envPassthrough.filter((name) => requested.has(name));
+  }
+  if (layer.httpProxy) {
+    if (layer.httpProxy.enabled === false) next.httpProxy.enabled = false;
+    if (layer.httpProxy.discoverKnownSecrets === false) {
+      next.httpProxy.discoverKnownSecrets = false;
+    }
+    if (layer.httpProxy.secrets) {
+      for (const [name, spec] of Object.entries(layer.httpProxy.secrets)) {
+        const current = next.httpProxy.secrets[name];
+        if (!current) continue;
+        if (spec === null) {
+          delete next.httpProxy.secrets[name];
+          continue;
+        }
+        const hosts = spec.hosts.filter((host) => current.hosts.includes(host));
+        if (hosts.length === 0) delete next.httpProxy.secrets[name];
+        else next.httpProxy.secrets[name] = { hosts, ...current.envVar ? { envVar: current.envVar } : {} };
+      }
+    }
+  }
+  next.mounts = restrictMounts(base.mounts, layer.mounts);
+  return next;
+}
+function restrictMounts(ceiling, requested) {
+  if (!requested) return ceiling.map((m) => ({ ...m }));
+  const byHost = new Map(ceiling.map((m) => [m.hostPath, m]));
+  const out = [];
+  for (const request of requested) {
+    const cap = byHost.get(request.hostPath);
+    if (!cap) continue;
+    const access = request.access === "rw" && cap.access === "ro" ? "ro" : request.access;
+    out.push({ hostPath: cap.hostPath, guestPath: cap.guestPath, access });
+  }
+  return out;
+}
+function applyLayer(base, layer, authority) {
+  if (authority === "global" || authority === "env") return applyOverride(base, layer);
+  if (authority === "trusted") {
+    const overridden = applyOverride(base, { ...layer, mounts: void 0, mountsExplicit: void 0 });
+    overridden.mounts = restrictMounts(base.mounts, layer.mounts);
+    return overridden;
+  }
+  return applyRestricting(base, layer);
+}
+function parseEnablementEnv(value) {
   if (value === void 0) return void 0;
-  const normalized = value.trim().toLowerCase();
-  return ["1", "true", "yes", "on"].includes(normalized);
+  const compact = value.trim().toLowerCase().replace(/[-_\s]+/g, "");
+  if (!compact) return void 0;
+  if (["force", "true", "1", "yes", "on"].includes(compact)) return true;
+  if (["dangerouslyforcedisable", "false", "0", "no", "off"].includes(compact)) return false;
+  return void 0;
 }
-function envConfig() {
-  let config;
+function envLayer() {
+  let layer = {};
   const encoded = process.env.PI_GONDOLIN_CONFIG;
   if (encoded) {
     try {
-      config = parseConfig(JSON.parse(encoded));
+      layer = parseLayer(JSON.parse(encoded));
     } catch {
-      config = void 0;
+      layer = {};
     }
   }
-  const enabled = parseBool(process.env.PI_GONDOLIN_ENABLED);
-  if (enabled !== void 0 && config) config.enabled = enabled;
-  else if (enabled !== void 0) {
-    config = { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} }, enabled };
+  const enabled = parseEnablementEnv(process.env.PI_GONDOLIN_ENABLED);
+  if (enabled !== void 0) layer.enabled = enabled;
+  return layer;
+}
+function readLayer(path4) {
+  if (!existsSync(path4)) return {};
+  try {
+    return parseLayer(JSON.parse(readFileSync(path4, "utf8")));
+  } catch {
+    return {};
   }
-  return config ?? { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
 }
 function loadConfig(ctx) {
-  const globalConfig = readConfigFile(join(homedir(), ".pi", "agent", "gondolin.json"));
-  const projectConfig = ctx.isProjectTrusted() ? readConfigFile(join(ctx.cwd, CONFIG_DIR_NAME, "gondolin.json")) : { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-  return mergeConfig(mergeConfig(globalConfig, projectConfig), envConfig());
+  const globalLayer = readLayer(join(homedir(), ".pi", "agent", "gondolin.json"));
+  const repoLayer = readLayer(join(ctx.cwd, CONFIG_DIR_NAME, "gondolin.json"));
+  const repoAuthority = ctx.isProjectTrusted() ? "trusted" : "untrusted";
+  return applyLayer(
+    applyLayer(applyLayer(withDefaults(), globalLayer, "global"), repoLayer, repoAuthority),
+    envLayer(),
+    "env"
+  );
 }
 
 // extensions/gondolin/src/secrets.ts
@@ -369,6 +506,26 @@ function createEditOps(vm, localCwd, guestWorkspace) {
   const w = createWriteOps(vm, localCwd, guestWorkspace);
   return { readFile: r.readFile, access: r.access, writeFile: w.writeFile };
 }
+function buildSandboxPromptAddendum(config, localCwd) {
+  const lines = [
+    "",
+    "## Gondolin sandbox",
+    `- You are running inside a micro-VM; host ${localCwd} is mounted read-write at ${config.guestWorkspace}.`
+  ];
+  for (const mount of config.mounts) {
+    const access = mount.access === "ro" ? "read-only" : "read-write";
+    lines.push(
+      `- Host ${mount.hostPath} is mounted ${access} at ${mount.guestPath}: host paths under ${mount.hostPath} resolve to ${mount.guestPath} inside the sandbox${mount.access === "ro" ? " (writes there fail with EROFS)" : ""}.`
+    );
+  }
+  if (config.httpProxy.enabled) {
+    lines.push(
+      "- API keys in the environment are sandbox stubs (they start with `gondolin-stub-`). Do not try to exchange or decode them: outbound HTTP requests that use a stub are transparently replaced with the real credential by the sandbox proxy, but only for that credential's allowed hosts.",
+      "- Requests carrying any other credential (including real, non-stub keys you obtain from the user) pass through the proxy unmodified."
+    );
+  }
+  return lines.join("\n");
+}
 function createGondolinReadOps(vm, localCwd, guestWorkspace) {
   return createReadOps(vm, localCwd, guestWorkspace);
 }
@@ -416,8 +573,9 @@ function createGondolinBashOps(vm, localCwd, guestWorkspace, envOptions) {
 }
 
 // extensions/gondolin/src/shared.ts
+import { existsSync as existsSync2 } from "node:fs";
 import path2 from "node:path";
-import { RealFSProvider, SandboxVfsProvider } from "@earendil-works/gondolin";
+import { ReadonlyProvider, RealFSProvider, SandboxVfsProvider } from "@earendil-works/gondolin";
 var GONDOLIN_SHARED_KEY = /* @__PURE__ */ Symbol.for("pi-packages.gondolin.shared");
 var SKIP_FS_OPS = /* @__PURE__ */ new Set([
   "read",
@@ -561,6 +719,41 @@ function launchGuestProcess(vm, spec, secrets, guestWorkspace) {
     ...spec.signal ? { signal: spec.signal } : {}
   });
 }
+function mapHostToGuestPath(hostCwd, guestWorkspace, mounts, hostPath) {
+  const viaWorkspace = hostPathToGuestPath(hostCwd, guestWorkspace, hostPath);
+  if (viaWorkspace) return viaWorkspace;
+  for (const mount of mounts) {
+    const rel = path2.relative(mount.hostPath, hostPath);
+    if (rel === "") return mount.guestPath;
+    if (!rel.startsWith("..") && !path2.isAbsolute(rel)) {
+      return path2.posix.join(mount.guestPath, rel.split(path2.sep).join("/"));
+    }
+  }
+  return void 0;
+}
+function buildExtraMountProviders(configMounts, guards, opts) {
+  const exists = opts?.exists ?? existsSync2;
+  const mounts = {};
+  const skipped = [];
+  for (const mount of configMounts) {
+    if (mounts[mount.guestPath]) {
+      skipped.push({ hostPath: mount.hostPath, guestPath: mount.guestPath, reason: "duplicate guest path" });
+      continue;
+    }
+    if (!exists(mount.hostPath)) {
+      skipped.push({ hostPath: mount.hostPath, guestPath: mount.guestPath, reason: "host path does not exist" });
+      continue;
+    }
+    const guarded = createGuardedWorkspaceProvider(
+      new RealFSProvider(mount.hostPath),
+      guards,
+      mount.hostPath,
+      mount.guestPath
+    );
+    mounts[mount.guestPath] = mount.access === "ro" ? new ReadonlyProvider(guarded) : guarded;
+  }
+  return { mounts, skipped };
+}
 function installGondolinShared(handle) {
   globalThis[GONDOLIN_SHARED_KEY] = handle;
 }
@@ -584,6 +777,9 @@ function gondolinExtension(pi) {
     get guestWorkspace() {
       return config.guestWorkspace;
     },
+    get mounts() {
+      return config.mounts.map((mount) => ({ hostPath: mount.hostPath, guestPath: mount.guestPath, access: mount.access }));
+    },
     isEnabled: () => config.enabled,
     refreshTrust: (isProjectTrusted) => {
       trustedRef.value = isProjectTrusted;
@@ -592,7 +788,7 @@ function gondolinExtension(pi) {
     },
     ensureVm: () => ensureVm(),
     getVm: () => state.vm,
-    toGuestPath: (hostPath) => hostPathToGuestPath(localCwd, config.guestWorkspace, hostPath),
+    toGuestPath: (hostPath) => mapHostToGuestPath(localCwd, config.guestWorkspace, config.mounts, hostPath),
     registerFsGuard: (guard) => {
       fsGuards.add(guard);
       return () => {
@@ -617,6 +813,16 @@ function gondolinExtension(pi) {
       state.secrets = discoverSecrets(process.env, config);
       const guestWorkspace = config.guestWorkspace;
       ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting (accel ${config.accel}, mount ${guestWorkspace})`));
+      const extraMounts = buildExtraMountProviders(config.mounts, fsGuards);
+      const vfsMounts = {
+        [guestWorkspace]: createGuardedWorkspaceProvider(
+          new RealFSProvider(localCwd),
+          fsGuards,
+          localCwd,
+          guestWorkspace
+        )
+      };
+      Object.assign(vfsMounts, extraMounts.mounts);
       const httpHooks = config.httpProxy.enabled ? createHttpHooks({
         // Omitted = allow all hosts; requests without stubs always pass through.
         ...config.allowedHosts ? { allowedHosts: config.allowedHosts } : {},
@@ -638,14 +844,8 @@ function gondolinExtension(pi) {
           // The host workspace is mounted through a guardable provider so
           // other extensions (File Guard) can enforce policy at the VM
           // filesystem layer instead of restricting the tools themselves.
-          mounts: {
-            [guestWorkspace]: createGuardedWorkspaceProvider(
-              new RealFSProvider(localCwd),
-              fsGuards,
-              localCwd,
-              guestWorkspace
-            )
-          }
+          // Extra host mounts (skills, user folders) are added alongside.
+          mounts: vfsMounts
         },
         sessionLabel: `pi-gondolin:${path3.basename(localCwd)}`
       });
@@ -653,7 +853,13 @@ function gondolinExtension(pi) {
       state.error = void 0;
       const stubCount = state.secrets.length;
       const proxyNote = config.httpProxy.enabled ? `; ${stubCount} credential${stubCount === 1 ? "" : "s"} stubbed (real values stay host-side)` : "";
-      ctx?.ui.notify(`Gondolin VM ready \u2014 host ${localCwd} mounted at ${guestWorkspace}${proxyNote}`, "info");
+      const mountCount = Object.keys(extraMounts.mounts).length;
+      const mountNote = mountCount > 0 ? `; ${mountCount} extra mount${mountCount === 1 ? "" : "s"}` : "";
+      const skipNote = extraMounts.skipped.length > 0 ? `; ${extraMounts.skipped.length} mount${extraMounts.skipped.length === 1 ? "" : "s"} skipped` : "";
+      ctx?.ui.notify(
+        `Gondolin VM ready \u2014 host ${localCwd} mounted at ${guestWorkspace}${mountNote}${skipNote}${proxyNote}`,
+        "info"
+      );
       return created;
     })();
     try {
@@ -744,16 +950,7 @@ function gondolinExtension(pi) {
       `Current working directory: ${localCwd}`,
       `Current working directory: ${config.guestWorkspace} (Gondolin VM, host mount: ${localCwd})`
     );
-    const extra = [
-      "",
-      "## Gondolin sandbox",
-      `- You are running inside a micro-VM; host ${localCwd} is mounted read-write at ${config.guestWorkspace}.`,
-      ...config.httpProxy.enabled ? [
-        "- API keys in the environment are sandbox stubs (they start with `gondolin-stub-`). Do not try to exchange or decode them: outbound HTTP requests that use a stub are transparently replaced with the real credential by the sandbox proxy, but only for that credential's allowed hosts.",
-        "- Requests carrying any other credential (including real, non-stub keys you obtain from the user) pass through the proxy unmodified."
-      ] : []
-    ].join("\n");
-    return { systemPrompt: `${modified}${extra}` };
+    return { systemPrompt: `${modified}${buildSandboxPromptAddendum(config, localCwd)}` };
   });
   pi.registerCommand("gondolin", {
     description: "Show Gondolin VM status, QEMU accel mode, and stubbed credential hosts",
@@ -768,9 +965,13 @@ function gondolinExtension(pi) {
       const lines = [
         `vm: ${state.vm ? "running" : state.starting ? "starting" : state.error ? `failed \u2014 ${state.error}` : "not started"}`,
         `accel: ${config.accel} (QEMU; "tcg" = software emulation, nested-VM safe)`,
-        `mount: ${localCwd} \u2192 ${config.guestWorkspace}`,
-        `shared handle: published (fs guards: ${fsGuards.size})`
+        `mount: ${localCwd} \u2192 ${config.guestWorkspace} (read-write)`
       ];
+      for (const mount of config.mounts) {
+        const missing = existsSync3(mount.hostPath) ? "" : " (host path does not exist; not mounted)";
+        lines.push(`mount: ${mount.hostPath} \u2192 ${mount.guestPath} (${mount.access})${missing}`);
+      }
+      lines.push(`shared handle: published (fs guards: ${fsGuards.size})`);
       if (config.httpProxy.enabled) {
         const allowedHosts = config.allowedHosts ? config.allowedHosts.join(", ") || "(deny all)" : "(allow all hosts)";
         lines.push(`http proxy: enabled; allowedHosts ${allowedHosts}`);

@@ -17,6 +17,7 @@ import {
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import type { VM } from "@earendil-works/gondolin";
+import type { GondolinConfig } from "./config.ts";
 import type { DiscoveredSecret } from "./secrets.ts";
 import { sanitizeGuestEnv } from "./secrets.ts";
 
@@ -123,6 +124,32 @@ function createEditOps(vm: VM, localCwd: string, guestWorkspace: string): EditOp
 	const r = createReadOps(vm, localCwd, guestWorkspace);
 	const w = createWriteOps(vm, localCwd, guestWorkspace);
 	return { readFile: r.readFile, access: r.access, writeFile: w.writeFile };
+}
+
+/**
+ * The sandbox section appended to the system prompt. Pure over the config,
+ * so the wording (including the host↔guest mount mapping the agent needs to
+ * resolve skill paths) is unit-testable without a VM.
+ */
+export function buildSandboxPromptAddendum(config: GondolinConfig, localCwd: string): string {
+	const lines = [
+		"",
+		"## Gondolin sandbox",
+		`- You are running inside a micro-VM; host ${localCwd} is mounted read-write at ${config.guestWorkspace}.`,
+	];
+	for (const mount of config.mounts) {
+		const access = mount.access === "ro" ? "read-only" : "read-write";
+		lines.push(
+			`- Host ${mount.hostPath} is mounted ${access} at ${mount.guestPath}: host paths under ${mount.hostPath} resolve to ${mount.guestPath} inside the sandbox${mount.access === "ro" ? " (writes there fail with EROFS)" : ""}.`,
+		);
+	}
+	if (config.httpProxy.enabled) {
+		lines.push(
+			"- API keys in the environment are sandbox stubs (they start with `gondolin-stub-`). Do not try to exchange or decode them: outbound HTTP requests that use a stub are transparently replaced with the real credential by the sandbox proxy, but only for that credential's allowed hosts.",
+			"- Requests carrying any other credential (including real, non-stub keys you obtain from the user) pass through the proxy unmodified.",
+		);
+	}
+	return lines.join("\n");
 }
 
 export function createGondolinReadOps(vm: VM, localCwd: string, guestWorkspace: string): ReadOperations {

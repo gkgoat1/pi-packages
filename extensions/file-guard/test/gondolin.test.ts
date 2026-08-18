@@ -204,3 +204,19 @@ test("file-guard VM guard honors workspace-relative include patterns", async () 
 	const denied = await guard.before?.(request("open", "/host/proj/docs/x.md"));
 	assert.equal(denied !== undefined, true);
 });
+
+test("file-guard VM guard auto-allows reads of extra mounts outside the workspace", async () => {
+	// Skills and other host folders are mounted outside the workspace (and
+	// read-only by default). Reads must pass without a prompt so skills stay
+	// usable in the sandbox; writes to a read-write extra still mediate.
+	const allowedSet = fakeAllowedSet();
+	const guard = createVmFsGuard(depsFor(allowedSet, { hasUI: false, defaultPolicy: "deny" }));
+
+	// Read of a skills file outside the workspace: auto-allowed, no prompt.
+	assert.equal(await guard.before?.(request("open", "/home/me/.pi/agent/skills/foo/SKILL.md")), undefined);
+
+	// Write to the same out-of-workspace path is still mediated (denied here
+	// by the non-interactive deny policy).
+	const write = await guard.before?.({ ...request("open", "/home/me/.pi/agent/skills/foo/SKILL.md"), write: true });
+	assert.equal(write !== undefined, true);
+});

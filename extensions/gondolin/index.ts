@@ -36,15 +36,17 @@ import {
 	createReadTool,
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
 import { VM, createHttpHooks } from "@earendil-works/gondolin";
 import { loadConfig, type GondolinConfig } from "./src/config.ts";
 import { buildSecretDefinitions, buildStubEnv, discoverSecrets, type DiscoveredSecret } from "./src/secrets.ts";
-import { GUEST_BASE_ENV, createGondolinBashOps, createGondolinEditOps, createGondolinReadOps, createGondolinWriteOps } from "./src/ops.ts";
+import { GUEST_BASE_ENV, buildSandboxPromptAddendum, createGondolinBashOps, createGondolinEditOps, createGondolinReadOps, createGondolinWriteOps } from "./src/ops.ts";
 import {
+	buildExtraMountProviders,
 	createGuardedWorkspaceProvider,
-	hostPathToGuestPath,
 	installGondolinShared,
 	launchGuestProcess,
+	mapHostToGuestPath,
 	RealFSProvider,
 	type GondolinFsGuard,
 	type GondolinShared,
@@ -85,6 +87,9 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 		get guestWorkspace() {
 			return config.guestWorkspace;
 		},
+		get mounts() {
+			return config.mounts.map((mount) => ({ hostPath: mount.hostPath, guestPath: mount.guestPath, access: mount.access }));
+		},
 		isEnabled: () => config.enabled,
 		refreshTrust: (isProjectTrusted) => {
 			trustedRef.value = isProjectTrusted;
@@ -93,7 +98,7 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 		},
 		ensureVm: () => ensureVm(),
 		getVm: () => state.vm,
-		toGuestPath: (hostPath) => hostPathToGuestPath(localCwd, config.guestWorkspace, hostPath),
+		toGuestPath: (hostPath) => mapHostToGuestPath(localCwd, config.guestWorkspace, config.mounts, hostPath),
 		registerFsGuard: (guard) => {
 			fsGuards.add(guard);
 			return () => {
@@ -125,6 +130,17 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 
 			ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting (accel ${config.accel}, mount ${guestWorkspace})`));
 
+			const extraMounts = buildExtraMountProviders(config.mounts, fsGuards);
+			const vfsMounts: Record<string, import("@earendil-works/gondolin").VirtualProvider> = {
+				[guestWorkspace]: createGuardedWorkspaceProvider(
+					new RealFSProvider(localCwd),
+					fsGuards,
+					localCwd,
+					guestWorkspace,
+				),
+			};
+			Object.assign(vfsMounts, extraMounts.mounts);
+
 			const httpHooks = config.httpProxy.enabled
 				? createHttpHooks({
 						// Omitted = allow all hosts; requests without stubs always pass through.
@@ -149,14 +165,8 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 					// The host workspace is mounted through a guardable provider so
 					// other extensions (File Guard) can enforce policy at the VM
 					// filesystem layer instead of restricting the tools themselves.
-					mounts: {
-						[guestWorkspace]: createGuardedWorkspaceProvider(
-							new RealFSProvider(localCwd),
-							fsGuards,
-							localCwd,
-							guestWorkspace,
-						),
-					},
+					// Extra host mounts (skills, user folders) are added alongside.
+					mounts: vfsMounts,
 				},
 				sessionLabel: `pi-gondolin:${path.basename(localCwd)}`,
 			});
@@ -168,7 +178,16 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 			const proxyNote = config.httpProxy.enabled
 				? `; ${stubCount} credential${stubCount === 1 ? "" : "s"} stubbed (real values stay host-side)`
 				: "";
-			ctx?.ui.notify(`Gondolin VM ready — host ${localCwd} mounted at ${guestWorkspace}${proxyNote}`, "info");
+			const mountCount = Object.keys(extraMounts.mounts).length;
+			const mountNote = mountCount > 0 ? `; ${mountCount} extra mount${mountCount === 1 ? "" : "s"}` : "";
+			const skipNote =
+				extraMounts.skipped.length > 0
+					? `; ${extraMounts.skipped.length} mount${extraMounts.skipped.length === 1 ? "" : "s"} skipped`
+					: "";
+			ctx?.ui.notify(
+				`Gondolin VM ready — host ${localCwd} mounted at ${guestWorkspace}${mountNote}${skipNote}${proxyNote}`,
+				"info",
+			);
 			return created;
 		})();
 
@@ -284,18 +303,7 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 			`Current working directory: ${localCwd}`,
 			`Current working directory: ${config.guestWorkspace} (Gondolin VM, host mount: ${localCwd})`,
 		);
-		const extra = [
-			"",
-			"## Gondolin sandbox",
-			`- You are running inside a micro-VM; host ${localCwd} is mounted read-write at ${config.guestWorkspace}.`,
-			...(config.httpProxy.enabled
-				? [
-						"- API keys in the environment are sandbox stubs (they start with `gondolin-stub-`). Do not try to exchange or decode them: outbound HTTP requests that use a stub are transparently replaced with the real credential by the sandbox proxy, but only for that credential's allowed hosts.",
-						"- Requests carrying any other credential (including real, non-stub keys you obtain from the user) pass through the proxy unmodified.",
-					]
-				: []),
-		].join("\n");
-		return { systemPrompt: `${modified}${extra}` };
+		return { systemPrompt: `${modified}${buildSandboxPromptAddendum(config, localCwd)}` };
 	});
 
 	// -------------------------------------------------------------------------
@@ -315,9 +323,13 @@ export default function gondolinExtension(pi: ExtensionAPI) {
 			const lines = [
 				`vm: ${state.vm ? "running" : state.starting ? "starting" : state.error ? `failed — ${state.error}` : "not started"}`,
 				`accel: ${config.accel} (QEMU; "tcg" = software emulation, nested-VM safe)`,
-				`mount: ${localCwd} → ${config.guestWorkspace}`,
-				`shared handle: published (fs guards: ${fsGuards.size})`,
+				`mount: ${localCwd} → ${config.guestWorkspace} (read-write)`,
 			];
+			for (const mount of config.mounts) {
+				const missing = existsSync(mount.hostPath) ? "" : " (host path does not exist; not mounted)";
+				lines.push(`mount: ${mount.hostPath} → ${mount.guestPath} (${mount.access})${missing}`);
+			}
+			lines.push(`shared handle: published (fs guards: ${fsGuards.size})`);
 			if (config.httpProxy.enabled) {
 				const allowedHosts = config.allowedHosts
 					? config.allowedHosts.join(", ") || "(deny all)"

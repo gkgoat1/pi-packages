@@ -2,9 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	DEFAULTS_PLACEHOLDER,
-	parseConfig,
-	mergeConfig,
+	applyLayer,
+	defaultMounts,
 	envConfig,
+	loadConfig,
+	mergeConfig,
+	parseConfig,
+	parseEnablementEnv,
+	parseLayer,
+	restrictMounts,
+	type MountConfig,
 } from "../src/config.ts";
 import {
 	buildSecretDefinitions,
@@ -15,9 +22,10 @@ import {
 	sanitizeGuestEnv,
 } from "../src/secrets.ts";
 import type { RandomSource } from "../src/secrets.ts";
-import { GUEST_BASE_ENV, buildGuestEnv, toGuestPath } from "../src/ops.ts";
+import { GUEST_BASE_ENV, buildGuestEnv, buildSandboxPromptAddendum, toGuestPath } from "../src/ops.ts";
 import type { VM } from "@earendil-works/gondolin";
 import {
+	buildExtraMountProviders,
 	clearGondolinSharedForTest,
 	createGuardedWorkspaceProvider,
 	getGondolinShared,
@@ -26,6 +34,7 @@ import {
 	installGondolinShared,
 	isWriteFsOp,
 	launchGuestProcess,
+	mapHostToGuestPath,
 	stubifyEnv,
 	toHostPath,
 	type FsGuardRequest,
@@ -34,8 +43,8 @@ import {
 import { MemoryProvider } from "@earendil-works/gondolin";
 import { createHttpHooks } from "@earendil-works/gondolin";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const fixedRandom: RandomSource = { hex: () => "0123456789abcdef" };
@@ -328,6 +337,7 @@ test("gondolin shared handle installs and reads via the registered symbol", () =
 		version: 1,
 		hostCwd: "/host",
 		guestWorkspace: "/workspace",
+		mounts: [],
 		isEnabled: () => true,
 		refreshTrust: () => true,
 		ensureVm: async () => null,
@@ -477,4 +487,308 @@ test("gondolin execGuest launches via the guest shell with stubbed env", async (
 	assert.equal(env.EXTRA, "1");
 	assert.equal(env.PATH, GUEST_BASE_ENV.PATH);
 	assert.equal(await proc.result, fakeResult);
+});
+
+// ---------------------------------------------------------------------------
+// Config authority model (global ceiling / repo restrict-only / env overrides)
+// ---------------------------------------------------------------------------
+
+test("gondolin parseEnablementEnv recognizes force and dangerously-force-disable", () => {
+	const parse = parseEnablementEnv;
+	assert.equal(parse(undefined), undefined);
+	assert.equal(parse(""), undefined);
+	assert.equal(parse("nope"), undefined);
+	assert.equal(parse("force"), true);
+	assert.equal(parse("FORCE"), true);
+	assert.equal(parse("true"), true);
+	assert.equal(parse("1"), true);
+	assert.equal(parse("dangerously-force-disable"), false);
+	assert.equal(parse("dangerously_force_disable"), false);
+	assert.equal(parse("dangerouslyforcedisable"), false);
+	assert.equal(parse("false"), false);
+	assert.equal(parse("0"), false);
+});
+
+test("gondolin default mounts are the skills dir, read-only", () => {
+	const mounts = defaultMounts("/home/me");
+	assert.deepEqual(mounts, [
+		{ hostPath: "/home/me/.pi/agent/skills", access: "ro", guestPath: "/root/.pi/agent/skills" },
+	]);
+});
+
+test("gondolin parseConfig mounts default to skills, and explicit mounts replace", () => {
+	const disabled = parseConfig({});
+	assert.equal(disabled.mounts.length, 1);
+	assert.equal(disabled.mounts[0].access, "ro");
+
+	const enabled = parseConfig({
+		enabled: true,
+		mounts: {
+			"skills": "ro",
+			"~/docs": "rw",
+			"/abs/ref": { access: "ro", guestPath: "/ref" },
+			"relative/path": "ro",
+			"skills-dup": "rw",
+		},
+	});
+	// skills alias + ~ expansion + explicit guest path honored; relative key ignored.
+	assert.deepEqual(
+		enabled.mounts.map((m) => ({ hostPath: m.hostPath, access: m.access, guestPath: m.guestPath })),
+		[
+			{ hostPath: join(homedir(), ".pi", "agent", "skills"), access: "ro", guestPath: "/root/.pi/agent/skills" },
+			{ hostPath: join(homedir(), "docs"), access: "rw", guestPath: "/mnt/docs" },
+			{ hostPath: "/abs/ref", access: "ro", guestPath: "/ref" },
+		],
+	);
+});
+
+test("gondolin restrictMounts only narrows the ceiling", () => {
+	const ceiling: MountConfig[] = [
+		{ hostPath: "/skills", access: "ro", guestPath: "/skills" },
+		{ hostPath: "/docs", access: "rw", guestPath: "/mnt/docs" },
+	];
+	// rw request under ro ceiling is clamped to ro.
+	assert.deepEqual(
+		restrictMounts(ceiling, [{ hostPath: "/skills", access: "rw", guestPath: "/skills" }]),
+		[{ hostPath: "/skills", access: "ro", guestPath: "/skills" }],
+	);
+	// ro request under rw ceiling downgrades.
+	assert.deepEqual(
+		restrictMounts(ceiling, [{ hostPath: "/docs", access: "ro", guestPath: "/mnt/docs" }]),
+		[{ hostPath: "/docs", access: "ro", guestPath: "/mnt/docs" }],
+	);
+	// new path outside the ceiling is ignored; omission removes.
+	assert.deepEqual(
+		restrictMounts(ceiling, [{ hostPath: "/secret", access: "ro", guestPath: "/mnt/secret" }]),
+		[],
+	);
+	// no request = inherit the ceiling.
+	assert.equal(restrictMounts(ceiling, undefined).length, 2);
+});
+
+test("gondolin applyLayer trusted overrides prefs but restricts mounts", () => {
+	const base = parseConfig({
+		enabled: true,
+		accel: "tcg",
+		allowedHosts: ["a.example", "b.example"],
+		envPassthrough: ["LANG", "TZ"],
+		mounts: { "skills": "ro", "~/docs": "rw" },
+		httpProxy: { secrets: { A: { hosts: ["a.example", "x.example"] } } },
+	});
+	const repo = parseLayer({
+		accel: "hvf",
+		allowedHosts: ["a.example"],
+		mounts: { "skills": "ro" },
+	});
+	const out = applyLayer(base, repo, "trusted");
+	assert.equal(out.accel, "hvf");
+	assert.deepEqual(out.allowedHosts, ["a.example"]);
+	assert.deepEqual(out.envPassthrough, ["LANG", "TZ"]); // trusted override: absent = keep base
+	// mounts restricted: docs dropped, skills kept ro.
+	assert.deepEqual(out.mounts, [
+		{ hostPath: join(homedir(), ".pi", "agent", "skills"), access: "ro", guestPath: "/root/.pi/agent/skills" },
+	]);
+	// secret survives (trusted full override, repo didn't touch it).
+	assert.deepEqual(Object.keys(out.httpProxy.secrets), ["A"]);
+});
+
+test("gondolin applyLayer untrusted can only restrict", () => {
+	const base = parseConfig({
+		enabled: true,
+		accel: "tcg",
+		allowedHosts: ["a.example", "b.example"],
+		envPassthrough: ["LANG", "TZ"],
+		mounts: { "skills": "ro", "~/docs": "rw" },
+		httpProxy: { enabled: true, discoverKnownSecrets: true, secrets: { A: { hosts: ["a.example", "x.example"] }, B: { hosts: ["b.example"] } } },
+	});
+	const repo = parseLayer({
+		enabled: false, // ignored
+		accel: "hvf", // ignored
+		allowedHosts: ["a.example", "z.example"], // narrowed to intersection
+		envPassthrough: ["LANG", "ZZ"], // narrowed
+		mounts: { "skills": "rw", "~/docs": "ro", "/secret": "ro" }, // skills clamped to ro, docs downgraded, secret ignored
+		httpProxy: {
+			enabled: false, // honored
+			discoverKnownSecrets: false, // honored
+			secrets: { A: { hosts: ["a.example"] }, B: { hosts: [] }, C: { hosts: ["c.example"] } }, // A narrowed, B removed, C ignored
+		},
+	});
+	const out = applyLayer(base, repo, "untrusted");
+	assert.equal(out.enabled, true); // cannot disable
+	assert.equal(out.accel, "tcg"); // cannot change
+	assert.deepEqual(out.allowedHosts, ["a.example"]);
+	assert.deepEqual(out.envPassthrough, ["LANG"]);
+	assert.equal(out.httpProxy.enabled, false);
+	assert.equal(out.httpProxy.discoverKnownSecrets, false);
+	assert.deepEqual(Object.keys(out.httpProxy.secrets), ["A"]);
+	assert.deepEqual(out.httpProxy.secrets.A.hosts, ["a.example"]);
+	assert.deepEqual(
+		out.mounts.map((m) => m.access),
+		["ro", "ro"],
+	);
+	assert.deepEqual(
+		out.mounts.map((m) => m.hostPath),
+		[join(homedir(), ".pi", "agent", "skills"), join(homedir(), "docs")],
+	);
+});
+
+test("gondolin env layer force-enables over a disabled global, and dangerously-force-disable wins", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-gondolin-home-"));
+	const repo = await mkdtemp(join(tmpdir(), "pi-gondolin-repo-"));
+	await mkdir(join(home, ".pi", "agent"), { recursive: true });
+	await mkdir(join(repo, ".pi"), { recursive: true });
+	await writeFile(join(home, ".pi", "agent", "gondolin.json"), JSON.stringify({ enabled: false }));
+	const previousHome = process.env.HOME;
+	const previous = { ...process.env };
+	try {
+		process.env.HOME = home;
+		delete process.env.PI_GONDOLIN_ENABLED;
+		delete process.env.PI_GONDOLIN_CONFIG;
+		assert.equal(loadConfig({ cwd: repo, isProjectTrusted: () => true }).enabled, false);
+
+		process.env.PI_GONDOLIN_ENABLED = "force";
+		assert.equal(loadConfig({ cwd: repo, isProjectTrusted: () => false }).enabled, true);
+
+		await writeFile(join(home, ".pi", "agent", "gondolin.json"), JSON.stringify({ enabled: true }));
+		process.env.PI_GONDOLIN_ENABLED = "dangerously-force-disable";
+		assert.equal(loadConfig({ cwd: repo, isProjectTrusted: () => true }).enabled, false);
+
+		// PI_GONDOLIN_CONFIG mounts replace the ceiling (env is unconditional).
+		process.env.PI_GONDOLIN_ENABLED = "force";
+		process.env.PI_GONDOLIN_CONFIG = JSON.stringify({ mounts: { "/opt/data": "rw" } });
+		const envMounted = loadConfig({ cwd: repo, isProjectTrusted: () => false });
+		assert.equal(envMounted.enabled, true);
+		assert.deepEqual(envMounted.mounts, [{ hostPath: "/opt/data", access: "rw", guestPath: "/mnt/data" }]);
+	} finally {
+		process.env.HOME = previousHome;
+		delete process.env.PI_GONDOLIN_ENABLED;
+		delete process.env.PI_GONDOLIN_CONFIG;
+		Object.assign(process.env, previous);
+		await rm(home, { recursive: true, force: true });
+		await rm(repo, { recursive: true, force: true });
+	}
+});
+
+test("gondolin loadConfig layers global ceiling and repo restrictions", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-gondolin-home-"));
+	const repo = await mkdtemp(join(tmpdir(), "pi-gondolin-repo-"));
+	await mkdir(join(home, ".pi", "agent"), { recursive: true });
+	await mkdir(join(repo, ".pi"), { recursive: true });
+	await writeFile(
+		join(home, ".pi", "agent", "gondolin.json"),
+		JSON.stringify({
+			enabled: true,
+			accel: "tcg",
+			mounts: { "skills": "ro", "~/docs": "rw" },
+			allowedHosts: ["a.example", "b.example"],
+			envPassthrough: ["LANG", "TZ"],
+			httpProxy: { secrets: { A: { hosts: ["a.example", "x.example"] }, B: { hosts: ["b.example"] } } },
+		}),
+	);
+	const previousHome = process.env.HOME;
+	const previous = { ...process.env };
+	try {
+		process.env.HOME = home;
+		delete process.env.PI_GONDOLIN_ENABLED;
+		delete process.env.PI_GONDOLIN_CONFIG;
+
+		// trusted repo overrides prefs and restricts mounts.
+		await writeFile(join(repo, ".pi", "gondolin.json"), JSON.stringify({ accel: "hvf", mounts: { "skills": "ro" } }));
+		const trusted = loadConfig({ cwd: repo, isProjectTrusted: () => true });
+		assert.equal(trusted.accel, "hvf");
+		assert.deepEqual(trusted.mounts, [
+			{ hostPath: join(home, ".pi", "agent", "skills"), access: "ro", guestPath: "/root/.pi/agent/skills" },
+		]);
+
+		// untrusted repo can only restrict.
+		await writeFile(join(repo, ".pi", "gondolin.json"), JSON.stringify({ enabled: false, mounts: { "~/docs": "ro" } }));
+		const untrusted = loadConfig({ cwd: repo, isProjectTrusted: () => false });
+		assert.equal(untrusted.enabled, true); // cannot disable
+		assert.equal(untrusted.accel, "tcg"); // cannot change
+		assert.deepEqual(untrusted.mounts, [
+			{ hostPath: join(home, "docs"), access: "ro", guestPath: "/mnt/docs" },
+		]);
+	} finally {
+		process.env.HOME = previousHome;
+		Object.assign(process.env, previous);
+		delete process.env.PI_GONDOLIN_ENABLED;
+		delete process.env.PI_GONDOLIN_CONFIG;
+		await rm(home, { recursive: true, force: true });
+		await rm(repo, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Extra mounts: provider building + host↔guest mapping
+// ---------------------------------------------------------------------------
+
+test("gondolin buildExtraMountProviders wraps ro mounts and skips missing/duplicate paths", async () => {
+	const skills = await mkdtemp(join(tmpdir(), "pi-gondolin-skills-"));
+	const docs = await mkdtemp(join(tmpdir(), "pi-gondolin-docs-"));
+	await writeFile(join(skills, "SKILL.md"), "# skill");
+	const guards = new Set<GondolinFsGuard>();
+	const seen: FsGuardRequest[] = [];
+	guards.add({ before: async (r) => { seen.push(r); return undefined; }, after: async () => {} });
+
+	const build = buildExtraMountProviders(
+		[
+			{ hostPath: skills, access: "ro", guestPath: "/root/.pi/agent/skills" },
+			{ hostPath: docs, access: "rw", guestPath: "/mnt/docs" },
+			{ hostPath: "/definitely/not/there", access: "ro", guestPath: "/mnt/missing" },
+		],
+		guards,
+	);
+	assert.deepEqual(Object.keys(build.mounts).sort(), ["/mnt/docs", "/root/.pi/agent/skills"]);
+	assert.equal(build.skipped.length, 1);
+	assert.equal(build.skipped[0].guestPath, "/mnt/missing");
+
+	// Read-only mount blocks writes with EROFS (errno 30) before the guard runs.
+	await assert.rejects(build.mounts["/root/.pi/agent/skills"].open("/SKILL.md", "w"), (error: unknown) => {
+		const err = error as NodeJS.ErrnoException;
+		assert.equal(Math.abs((err.errno as number) ?? 0), 30);
+		return true;
+	});
+
+	// Reads pass through and the guard sees the mapped host path.
+	seen.length = 0;
+	await build.mounts["/root/.pi/agent/skills"].readFile!("/SKILL.md");
+	assert.equal(seen.at(-1)?.hostPath, join(skills, "SKILL.md"));
+	assert.equal(seen.at(-1)?.guestPath, "/SKILL.md");
+
+	// Read-write mount allows writes (to the temp dir).
+	await build.mounts["/mnt/docs"].writeFile!("/note.txt", Buffer.from("hi"));
+	assert.equal((await build.mounts["/mnt/docs"].readFile!("/note.txt")).toString(), "hi");
+
+	await rm(skills, { recursive: true, force: true });
+	await rm(docs, { recursive: true, force: true });
+});
+
+test("gondolin mapHostToGuestPath resolves workspace and extra mounts", () => {
+	const mounts = [
+		{ hostPath: "/home/me/.pi/agent/skills", guestPath: "/root/.pi/agent/skills" },
+		{ hostPath: "/home/me/docs", guestPath: "/mnt/docs" },
+	];
+	assert.equal(mapHostToGuestPath("/host/proj", "/workspace", [], "/host/proj/src/a.ts"), "/workspace/src/a.ts");
+	assert.equal(mapHostToGuestPath("/host/proj", "/workspace", mounts, "/home/me/.pi/agent/skills"), "/root/.pi/agent/skills");
+	assert.equal(
+		mapHostToGuestPath("/host/proj", "/workspace", mounts, "/home/me/docs/sub/note.md"),
+		"/mnt/docs/sub/note.md",
+	);
+	assert.equal(mapHostToGuestPath("/host/proj", "/workspace", mounts, "/etc/passwd"), undefined);
+});
+
+test("gondolin buildSandboxPromptAddendum lists mounts and proxy stubs", () => {
+	const withProxy = parseConfig({
+		enabled: true,
+		mounts: { "skills": "ro", "~/docs": "rw" },
+	});
+	const addendum = buildSandboxPromptAddendum(withProxy, "/host/proj");
+	assert.equal(addendum.includes("## Gondolin sandbox"), true);
+	assert.equal(addendum.includes("read-write at /workspace"), true);
+	assert.equal(addendum.includes("/root/.pi/agent/skills"), true);
+	assert.equal(addendum.includes("read-only"), true);
+	assert.equal(addendum.includes("gondolin-stub-"), true);
+
+	const noProxy = parseConfig({ enabled: true, httpProxy: { enabled: false } });
+	assert.equal(buildSandboxPromptAddendum(noProxy, "/host/proj").includes("gondolin-stub-"), false);
 });

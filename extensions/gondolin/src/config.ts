@@ -1,15 +1,36 @@
 /**
  * Configuration loading for the Gondolin sandbox extension.
  *
- * Layering (later wins): global (`~/.pi/agent/gondolin.json`) ←
- * trusted project (`.pi/gondolin.json`) ← `PI_GONDOLIN_CONFIG` JSON.
- * `PI_GONDOLIN_ENABLED` is a boolean shortcut for the top-level `enabled`
- * flag.
+ * Authority model — who may set what (later layers win within their authority):
+ *
+ *   defaults → global file → repo file → environment
+ *
+ * - global (`~/.pi/agent/gondolin.json`): the user's machine-wide policy and
+ *   the *ceiling* for every capability — which host folders may be mounted
+ *   (and at what maximum access), which credentials exist, egress allowlists.
+ * - repo (`.pi/gondolin.json`): trusted projects may override the whole
+ *   surface *except mounts*: every repo — trusted or not — can only restrict
+ *   mounts below the global ceiling (drop a mount, or downgrade rw → ro).
+ *   Untrusted repos can additionally only restrict everything else: disable
+ *   the HTTP proxy, narrow host allowlists / env passthrough / credential
+ *   hosts. Nothing an untrusted repo writes can grant capability, because
+ *   the agent itself can write that file.
+ * - environment: `PI_GONDOLIN_ENABLED=force` / `dangerously-force-disable`
+ *   and `PI_GONDOLIN_CONFIG` (JSON) are honored unconditionally — the user
+ *   typed them when launching Pi, and a malicious agent cannot change the
+ *   environment of the already-running process without being detected.
+ *
+ * Mounts: the host workspace is always mounted read-write at
+ * `guestWorkspace`. Extra host folders come from the `mounts` config key
+ * (`"<host path>": "ro" | "rw" | { "access": ..., "guestPath": ... }`,
+ * `~` expanded, `"skills"` aliases the global skills directory). When no
+ * config mentions `mounts`, the default is the global skills directory
+ * mounted read-only and nothing else.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /** A credential the proxy may inflate. `envVar` reads the value from the host env. */
@@ -27,6 +48,16 @@ export interface HttpProxyConfig {
 	discoverKnownSecrets: boolean;
 	/** Extra credentials keyed by guest env var name. */
 	secrets: Record<string, SecretSpec>;
+}
+
+/** An extra host folder mounted into the guest (besides the workspace). */
+export interface MountConfig {
+	/** Absolute host path. */
+	hostPath: string;
+	/** Mount access. `ro` blocks every mutating operation with `EROFS`. */
+	access: "ro" | "rw";
+	/** Absolute guest path the host folder appears at. */
+	guestPath: string;
 }
 
 export interface GondolinConfig {
@@ -50,6 +81,38 @@ export interface GondolinConfig {
 	envPassthrough: string[];
 	/** HTTP proxy + credential stub configuration. */
 	httpProxy: HttpProxyConfig;
+	/**
+	 * Extra host mounts, already restricted to the global ceiling. The
+	 * workspace itself is not listed here (it is always mounted read-write
+	 * at `guestWorkspace`).
+	 */
+	mounts: MountConfig[];
+}
+
+/**
+ * A partially-specified config as written by one authority. Only explicitly
+ * set fields influence the layer; absence means "no opinion".
+ */
+export interface ConfigLayer {
+	enabled?: boolean;
+	accel?: string;
+	guestWorkspace?: string;
+	memory?: string;
+	cpus?: number;
+	image?: string;
+	startTimeoutMs?: number;
+	allowedHosts?: string[];
+	envPassthrough?: string[];
+	httpProxy?: {
+		enabled?: boolean;
+		discoverKnownSecrets?: boolean;
+		/** `null` values are explicit removals (`{ "hosts": [] }`). */
+		secrets?: Record<string, SecretSpec | null>;
+	};
+	/** Normalized mount requests; unmentioned ceiling mounts are dropped. */
+	mounts?: MountConfig[];
+	/** Whether the source spelled out a `mounts` key at all. */
+	mountsExplicit?: boolean;
 }
 
 const DEFAULTS: GondolinConfig = {
@@ -62,12 +125,43 @@ const DEFAULTS: GondolinConfig = {
 		discoverKnownSecrets: true,
 		secrets: {},
 	},
+	mounts: [],
 };
 
-/** Default config with a fresh empty secrets record (avoids shared mutation). */
-export function DEFAULTS_PLACEHOLDER(): GondolinConfig {
-	return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
+/** Guest path where the global skills directory is mounted by default. */
+export const SKILLS_GUEST_PATH = "/root/.pi/agent/skills";
+
+/** Default mount ceiling: global skills read-only, nothing else. */
+export function defaultMounts(home: string = homedir()): MountConfig[] {
+	return [
+		{
+			hostPath: join(home, ".pi", "agent", "skills"),
+			access: "ro",
+			guestPath: SKILLS_GUEST_PATH,
+		},
+	];
 }
+
+/** Default config with fresh empty containers (avoids shared mutation). */
+export function DEFAULTS_PLACEHOLDER(): GondolinConfig {
+	return {
+		...DEFAULTS,
+		httpProxy: { ...DEFAULTS.httpProxy, secrets: {} },
+		mounts: defaultMounts(),
+	};
+}
+
+function withDefaults(): GondolinConfig {
+	return {
+		...DEFAULTS,
+		httpProxy: { ...DEFAULTS.httpProxy, secrets: {} },
+		mounts: defaultMounts(),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -81,127 +175,346 @@ function asStringArray(value: unknown): string[] | undefined {
 		: undefined;
 }
 
-function parseSecretSpec(value: unknown): SecretSpec | undefined {
+/** Parse a secret spec; `null` = explicit removal, `undefined` = malformed. */
+function parseSecretSpec(value: unknown): SecretSpec | null | undefined {
 	const object = asObject(value);
 	if (!object) return undefined;
 	const hosts = asStringArray(object.hosts);
-	if (!hosts || hosts.length === 0) return undefined;
+	if (!hosts) return undefined;
+	if (hosts.length === 0) return null;
 	const spec: SecretSpec = { hosts };
 	if (typeof object.envVar === "string" && object.envVar) spec.envVar = object.envVar;
 	return spec;
 }
 
-function parseHttpProxy(value: unknown): HttpProxyConfig | undefined {
-	const object = asObject(value);
-	if (!object) return undefined;
-	const secrets: Record<string, SecretSpec> = {};
-	const secretMap = asObject(object.secrets);
-	if (secretMap) {
-		for (const [name, raw] of Object.entries(secretMap)) {
-			if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-			const spec = parseSecretSpec(raw);
-			if (spec) secrets[name] = spec;
-		}
-	}
-	return {
-		enabled: typeof object.enabled === "boolean" ? object.enabled : true,
-		discoverKnownSecrets: typeof object.discoverKnownSecrets === "boolean" ? object.discoverKnownSecrets : true,
-		secrets,
-	};
+/**
+ * Resolve a mounts-map key to an absolute host path. `~` is expanded against
+ * the home directory and the alias `skills` names the global skills dir.
+ * Returns undefined for keys that are neither absolute nor `~`-relative.
+ */
+export function normalizeHostKey(key: string, home: string): string | undefined {
+	if (key === "skills") return join(home, ".pi", "agent", "skills");
+	if (key === "~") return home;
+	if (key.startsWith("~/")) return join(home, key.slice(2));
+	if (key.startsWith("/")) return key;
+	return undefined;
 }
 
-/** Parse and validate raw JSON. Throws on malformed config. */
-export function parseConfig(value: unknown): GondolinConfig {
+function normalizeGuestPath(value: unknown, hostPath: string, home: string): string | undefined {
+	let guestPath: string | undefined;
+	if (typeof value === "string" && value.startsWith("/")) guestPath = value;
+	if (!guestPath) {
+		// Default: mirror the skills layout for the skills dir, /mnt/<name> otherwise.
+		guestPath =
+			hostPath === join(home, ".pi", "agent", "skills")
+				? SKILLS_GUEST_PATH
+				: `/mnt/${basename(hostPath)}`;
+	}
+	const segments: string[] = [];
+	for (const segment of guestPath.split("/")) {
+		if (!segment || segment === ".") continue;
+		if (segment === "..") return undefined;
+		segments.push(segment);
+	}
+	if (segments.length === 0) return undefined;
+	return `/${segments.join("/")}`;
+}
+
+function parseMountsValue(raw: unknown): MountConfig[] {
+	const object = asObject(raw);
+	if (!object) return [];
+	const home = homedir();
+	const byHost = new Map<string, MountConfig>();
+	for (const [key, value] of Object.entries(object)) {
+		const hostPath = normalizeHostKey(key, home);
+		if (!hostPath) continue;
+		let access: "ro" | "rw";
+		let guestRaw: unknown;
+		if (value === "ro" || value === "rw") access = value;
+		else if (asObject(value)) {
+			const accessRaw = asObject(value)?.access;
+			if (accessRaw === "ro" || accessRaw === "rw") access = accessRaw;
+			else continue;
+			guestRaw = asObject(value)?.guestPath;
+		} else continue; // "none"/unknown values mean "do not mount"
+		const guestPath = normalizeGuestPath(guestRaw, hostPath, home);
+		if (!guestPath) continue;
+		byHost.set(hostPath, { hostPath, access, guestPath });
+	}
+	// Later entries win guest-path collisions (same host key already replaced).
+	const mounts: MountConfig[] = [];
+	for (const entry of byHost.values()) {
+		const clash = mounts.findIndex((existing) => existing.guestPath === entry.guestPath);
+		if (clash >= 0) mounts.splice(clash, 1);
+		mounts.push(entry);
+	}
+	return mounts;
+}
+
+/** Parse raw JSON into a layer of only the explicitly set, well-formed fields. */
+export function parseLayer(value: unknown): ConfigLayer {
 	const root = asObject(value);
-	if (!root || root.enabled !== true) return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-	const httpProxy = parseHttpProxy(root.httpProxy) ?? {
-		enabled: true,
-		discoverKnownSecrets: true,
-		secrets: {},
-	};
-	const config: GondolinConfig = {
-		enabled: true,
-		accel: typeof root.accel === "string" && root.accel ? root.accel : DEFAULTS.accel,
-		guestWorkspace: typeof root.guestWorkspace === "string" && root.guestWorkspace
-			? root.guestWorkspace
-			: DEFAULTS.guestWorkspace,
-		envPassthrough: asStringArray(root.envPassthrough) ?? DEFAULTS.envPassthrough,
-		httpProxy,
-	};
-	if (typeof root.memory === "string" && root.memory) config.memory = root.memory;
-	if (Number.isInteger(root.cpus) && (root.cpus as number) > 0) config.cpus = root.cpus as number;
-	if (typeof root.image === "string" && root.image) config.image = root.image;
+	if (!root) return {};
+	const layer: ConfigLayer = {};
+	if (typeof root.enabled === "boolean") layer.enabled = root.enabled;
+	if (typeof root.accel === "string" && root.accel) layer.accel = root.accel;
+	if (typeof root.guestWorkspace === "string" && root.guestWorkspace.startsWith("/")) {
+		layer.guestWorkspace = root.guestWorkspace;
+	}
+	if (typeof root.memory === "string" && root.memory) layer.memory = root.memory;
+	if (Number.isInteger(root.cpus) && (root.cpus as number) > 0) layer.cpus = root.cpus as number;
+	if (typeof root.image === "string" && root.image) layer.image = root.image;
 	if (Number.isInteger(root.startTimeoutMs) && (root.startTimeoutMs as number) >= 0) {
-		config.startTimeoutMs = root.startTimeoutMs as number;
+		layer.startTimeoutMs = root.startTimeoutMs as number;
 	}
 	const allowedHosts = asStringArray(root.allowedHosts);
-	if (allowedHosts) config.allowedHosts = allowedHosts;
-	return config;
-}
+	if (allowedHosts) layer.allowedHosts = allowedHosts;
+	const envPassthrough = asStringArray(root.envPassthrough);
+	if (envPassthrough) layer.envPassthrough = envPassthrough;
 
-function readConfigFile(path: string): GondolinConfig {
-	if (!existsSync(path)) return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-	try {
-		return parseConfig(JSON.parse(readFileSync(path, "utf8")));
-	} catch {
-		return { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
+	const proxy = asObject(root.httpProxy);
+	if (proxy) {
+		const parsed: NonNullable<ConfigLayer["httpProxy"]> = {};
+		if (typeof proxy.enabled === "boolean") parsed.enabled = proxy.enabled;
+		if (typeof proxy.discoverKnownSecrets === "boolean") {
+			parsed.discoverKnownSecrets = proxy.discoverKnownSecrets;
+		}
+		const secretMap = asObject(proxy.secrets);
+		if (secretMap) {
+			const secrets: Record<string, SecretSpec | null> = {};
+			for (const [name, raw] of Object.entries(secretMap)) {
+				if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+				const spec = parseSecretSpec(raw);
+				if (spec !== undefined) secrets[name] = spec;
+			}
+			parsed.secrets = secrets;
+		}
+		if (Object.keys(parsed).length > 0) layer.httpProxy = parsed;
 	}
+
+	if (root.mounts !== undefined) {
+		layer.mounts = parseMountsValue(root.mounts);
+		layer.mountsExplicit = true;
+	}
+	return layer;
 }
 
-function mergeSecrets(base: Record<string, SecretSpec>, next: Record<string, SecretSpec>): Record<string, SecretSpec> {
-	return { ...base, ...next };
+// ---------------------------------------------------------------------------
+// Layer application
+// ---------------------------------------------------------------------------
+
+/** Which authority a layer speaks for. */
+export type LayerAuthority = "global" | "env" | "trusted" | "untrusted";
+
+function cloneConfig(base: GondolinConfig): GondolinConfig {
+	return { ...base, httpProxy: { ...base.httpProxy, secrets: { ...base.httpProxy.secrets } } };
 }
 
-/** Merge two layered configs; `next` wins for scalars, secrets merge per-key. */
-export function mergeConfig(base: GondolinConfig, next: GondolinConfig): GondolinConfig {
+/** Full-override application (global/env layers, and trusted non-mount fields). */
+function applyOverride(base: GondolinConfig, layer: ConfigLayer): GondolinConfig {
+	const next = cloneConfig(base);
+	if (layer.enabled !== undefined) next.enabled = layer.enabled;
+	if (layer.accel) next.accel = layer.accel;
+	if (layer.guestWorkspace) next.guestWorkspace = layer.guestWorkspace;
+	if (layer.memory) next.memory = layer.memory;
+	if (layer.cpus !== undefined) next.cpus = layer.cpus;
+	if (layer.image) next.image = layer.image;
+	if (layer.startTimeoutMs !== undefined) next.startTimeoutMs = layer.startTimeoutMs;
+	if (layer.allowedHosts) next.allowedHosts = [...layer.allowedHosts];
+	if (layer.envPassthrough) next.envPassthrough = [...layer.envPassthrough];
+	if (layer.httpProxy) {
+		if (layer.httpProxy.enabled !== undefined) next.httpProxy.enabled = layer.httpProxy.enabled;
+		if (layer.httpProxy.discoverKnownSecrets !== undefined) {
+			next.httpProxy.discoverKnownSecrets = layer.httpProxy.discoverKnownSecrets;
+		}
+		if (layer.httpProxy.secrets) {
+			for (const [name, spec] of Object.entries(layer.httpProxy.secrets)) {
+				if (spec === null) delete next.httpProxy.secrets[name];
+				else next.httpProxy.secrets[name] = { hosts: [...spec.hosts], ...(spec.envVar ? { envVar: spec.envVar } : {}) };
+			}
+		}
+	}
+	if (layer.mountsExplicit) next.mounts = layer.mounts ? layer.mounts.map((m) => ({ ...m })) : [];
+	return next;
+}
+
+/**
+ * Restrict-only application (untrusted repos): every field may only narrow
+ * the base. Enablement and preferences (accel, memory, image, …) are ignored
+ * entirely — an untrusted repo cannot turn the sandbox off or reconfigure it.
+ */
+function applyRestricting(base: GondolinConfig, layer: ConfigLayer): GondolinConfig {
+	const next = cloneConfig(base);
+	if (layer.allowedHosts) {
+		next.allowedHosts = base.allowedHosts
+			? layer.allowedHosts.filter((host) => base.allowedHosts!.includes(host))
+			: [...layer.allowedHosts];
+	}
+	if (layer.envPassthrough) {
+		const requested = new Set(layer.envPassthrough);
+		next.envPassthrough = base.envPassthrough.filter((name) => requested.has(name));
+	}
+	if (layer.httpProxy) {
+		if (layer.httpProxy.enabled === false) next.httpProxy.enabled = false;
+		if (layer.httpProxy.discoverKnownSecrets === false) {
+			next.httpProxy.discoverKnownSecrets = false;
+		}
+		if (layer.httpProxy.secrets) {
+			for (const [name, spec] of Object.entries(layer.httpProxy.secrets)) {
+				const current = next.httpProxy.secrets[name];
+				if (!current) continue; // cannot add credentials
+				if (spec === null) {
+					delete next.httpProxy.secrets[name];
+					continue;
+				}
+				const hosts = spec.hosts.filter((host) => current.hosts.includes(host));
+				if (hosts.length === 0) delete next.httpProxy.secrets[name];
+				else next.httpProxy.secrets[name] = { hosts, ...(current.envVar ? { envVar: current.envVar } : {}) };
+			}
+		}
+	}
+	next.mounts = restrictMounts(base.mounts, layer.mounts);
+	return next;
+}
+
+/**
+ * Restrict a mount ceiling by a repo's requests: only ceiling paths can stay
+ * mounted, access can only be downgraded (rw → ro), and requests outside the
+ * ceiling (or above it) fall back to the ceiling entry. Omitted mounts drop.
+ */
+export function restrictMounts(ceiling: MountConfig[], requested: MountConfig[] | undefined): MountConfig[] {
+	if (!requested) return ceiling.map((m) => ({ ...m }));
+	const byHost = new Map(ceiling.map((m) => [m.hostPath, m]));
+	const out: MountConfig[] = [];
+	for (const request of requested) {
+		const cap = byHost.get(request.hostPath);
+		if (!cap) continue; // not in the ceiling → not mountable from a repo
+		const access = request.access === "rw" && cap.access === "ro" ? "ro" : request.access;
+		out.push({ hostPath: cap.hostPath, guestPath: cap.guestPath, access });
+	}
+	return out;
+}
+
+/**
+ * Apply a layer onto a config under the given authority:
+ * - `global`/`env`: full override (env replaces the mount ceiling wholesale)
+ * - `trusted`: full override except mounts, which only restrict the ceiling
+ * - `untrusted`: restrict-only across the whole surface
+ */
+export function applyLayer(base: GondolinConfig, layer: ConfigLayer, authority: LayerAuthority): GondolinConfig {
+	if (authority === "global" || authority === "env") return applyOverride(base, layer);
+	if (authority === "trusted") {
+		const overridden = applyOverride(base, { ...layer, mounts: undefined, mountsExplicit: undefined });
+		overridden.mounts = restrictMounts(base.mounts, layer.mounts);
+		return overridden;
+	}
+	return applyRestricting(base, layer);
+}
+
+// ---------------------------------------------------------------------------
+// Public compat helpers
+// ---------------------------------------------------------------------------
+
+/** Parse and validate raw JSON as a standalone config. Throws on malformed JSON input. */
+export function parseConfig(value: unknown): GondolinConfig {
+	const layer = parseLayer(value);
+	if (layer.enabled !== true) return withDefaults();
+	return applyLayer(withDefaults(), layer, "global");
+}
+
+/** Rebuild a layer from a materialized config (every field is an opinion). */
+function configToLayer(config: GondolinConfig): ConfigLayer {
 	return {
-		enabled: next.enabled ?? base.enabled,
-		accel: next.accel ?? base.accel,
-		guestWorkspace: next.guestWorkspace ?? base.guestWorkspace,
-		memory: next.memory ?? base.memory,
-		cpus: next.cpus ?? base.cpus,
-		image: next.image ?? base.image,
-		startTimeoutMs: next.startTimeoutMs ?? base.startTimeoutMs,
-		allowedHosts: next.allowedHosts ?? base.allowedHosts,
-		envPassthrough: next.envPassthrough.length > 0 ? next.envPassthrough : base.envPassthrough,
+		enabled: config.enabled,
+		accel: config.accel,
+		guestWorkspace: config.guestWorkspace,
+		...(config.memory ? { memory: config.memory } : {}),
+		...(config.cpus !== undefined ? { cpus: config.cpus } : {}),
+		...(config.image ? { image: config.image } : {}),
+		...(config.startTimeoutMs !== undefined ? { startTimeoutMs: config.startTimeoutMs } : {}),
+		...(config.allowedHosts ? { allowedHosts: [...config.allowedHosts] } : {}),
+		envPassthrough: [...config.envPassthrough],
 		httpProxy: {
-			enabled: next.httpProxy.enabled && base.httpProxy.enabled,
-			discoverKnownSecrets: next.httpProxy.discoverKnownSecrets && base.httpProxy.discoverKnownSecrets,
-			secrets: mergeSecrets(base.httpProxy.secrets, next.httpProxy.secrets),
+			enabled: config.httpProxy.enabled,
+			discoverKnownSecrets: config.httpProxy.discoverKnownSecrets,
+			secrets: Object.fromEntries(
+				Object.entries(config.httpProxy.secrets).map(([name, spec]) => [
+					name,
+					{ hosts: [...spec.hosts], ...(spec.envVar ? { envVar: spec.envVar } : {}) },
+				]),
+			),
 		},
+		mounts: config.mounts.map((m) => ({ ...m })),
+		mountsExplicit: true,
 	};
 }
 
-function parseBool(value: string | undefined): boolean | undefined {
-	if (value === undefined) return undefined;
-	const normalized = value.trim().toLowerCase();
-	return ["1", "true", "yes", "on"].includes(normalized);
+/** Merge two layered configs (trusted-project semantics; `next` wins, mounts restrict-only). */
+export function mergeConfig(base: GondolinConfig, next: GondolinConfig): GondolinConfig {
+	return applyLayer(base, configToLayer(next), "trusted");
 }
 
-/** Config derived from `PI_GONDOLIN_*` environment variables. */
-export function envConfig(): GondolinConfig {
-	let config: GondolinConfig | undefined;
+/**
+ * Read `PI_GONDOLIN_ENABLED` as an enablement override:
+ * - `force` (aliases: true/1/yes/on) — force-enable the VM
+ * - `dangerously-force-disable` (aliases: false/0/no/off) — disable the VM
+ * - unset, empty, or unrecognized — no opinion (file config decides)
+ */
+export function parseEnablementEnv(value: string | undefined): boolean | undefined {
+	if (value === undefined) return undefined;
+	const compact = value.trim().toLowerCase().replace(/[-_\s]+/g, "");
+	if (!compact) return undefined;
+	if (["force", "true", "1", "yes", "on"].includes(compact)) return true;
+	if (["dangerouslyforcedisable", "false", "0", "no", "off"].includes(compact)) return false;
+	return undefined;
+}
+
+/** Config layer derived from `PI_GONDOLIN_*` environment variables. */
+export function envLayer(): ConfigLayer {
+	let layer: ConfigLayer = {};
 	const encoded = process.env.PI_GONDOLIN_CONFIG;
 	if (encoded) {
 		try {
-			config = parseConfig(JSON.parse(encoded));
+			layer = parseLayer(JSON.parse(encoded));
 		} catch {
-			config = undefined;
+			layer = {};
 		}
 	}
-	const enabled = parseBool(process.env.PI_GONDOLIN_ENABLED);
-	if (enabled !== undefined && config) config.enabled = enabled;
-	else if (enabled !== undefined) {
-		config = { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} }, enabled };
-	}
-	return config ?? { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
+	const enabled = parseEnablementEnv(process.env.PI_GONDOLIN_ENABLED);
+	if (enabled !== undefined) layer.enabled = enabled;
+	return layer;
 }
 
-/** Load and layer config from disk + environment. */
+/** Config derived from `PI_GONDOLIN_*` environment variables (defaults filled). */
+export function envConfig(): GondolinConfig {
+	return applyLayer(withDefaults(), envLayer(), "env");
+}
+
+// ---------------------------------------------------------------------------
+// File loading
+// ---------------------------------------------------------------------------
+
+function readLayer(path: string): ConfigLayer {
+	if (!existsSync(path)) return {};
+	try {
+		return parseLayer(JSON.parse(readFileSync(path, "utf8")));
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Load and layer config: global ceiling ← repo (authority by trust) ← env.
+ * The repo file is read even for untrusted projects — its restricting
+ * choices are honored, nothing it says can grant capability.
+ */
 export function loadConfig(ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">): GondolinConfig {
-	const globalConfig = readConfigFile(join(homedir(), ".pi", "agent", "gondolin.json"));
-	const projectConfig = ctx.isProjectTrusted()
-		? readConfigFile(join(ctx.cwd, CONFIG_DIR_NAME, "gondolin.json"))
-		: { ...DEFAULTS, httpProxy: { ...DEFAULTS.httpProxy, secrets: {} } };
-	return mergeConfig(mergeConfig(globalConfig, projectConfig), envConfig());
+	const globalLayer = readLayer(join(homedir(), ".pi", "agent", "gondolin.json"));
+	const repoLayer = readLayer(join(ctx.cwd, CONFIG_DIR_NAME, "gondolin.json"));
+	const repoAuthority: LayerAuthority = ctx.isProjectTrusted() ? "trusted" : "untrusted";
+	return applyLayer(
+		applyLayer(applyLayer(withDefaults(), globalLayer, "global"), repoLayer, repoAuthority),
+		envLayer(),
+		"env",
+	);
 }

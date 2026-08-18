@@ -26,6 +26,12 @@ In interception mode:
   exactly like in tool mode, and decisions persist for the session.
 - **View mode** logs mutating filesystem operations inside the VM (plus the
   host-side search tools) as timeline entries.
+- **Extra mounts**: Gondolin can mount additional host folders (the global
+  skills directory is mounted read-only by default). Reads of those folders
+  are allowed without prompting — they are read-only mounts granted by *global*
+  config, and blocking reads would make skills unusable in the sandbox. Writes
+  to a read-write extra mount are still mediated like any other write;
+  read-only mounts reject writes with `EROFS` before File Guard is consulted.
 
 The host-side `grep`/`find`/`ls` tools do not run in the VM, so they keep the
 regular tool-level guard. Interception activates only when both File Guard

@@ -1367,6 +1367,7 @@ function createVmFsGuard(deps) {
     async before(request) {
       const relPath = relative2(deps.cwd, request.hostPath);
       const relInside = relPath !== "" && !relPath.startsWith("..") && !relPath.includes(":");
+      if (!request.write && !relInside && request.hostPath !== deps.cwd) return void 0;
       const allowed = deps.isAllowed(request.hostPath) || relInside && deps.isAllowed(relPath);
       if (allowed) return void 0;
       let reason;

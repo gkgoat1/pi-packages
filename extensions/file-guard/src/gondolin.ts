@@ -126,6 +126,12 @@ export function createVmFsGuard(deps: VmGuardDeps): VmFsGuard {
 			// here so relative includes keep working under interception.
 			const relPath = relative(deps.cwd, request.hostPath);
 			const relInside = relPath !== "" && !relPath.startsWith("..") && !relPath.includes(":");
+			// Reads of Gondolin's extra mounts (skills and other host folders
+			// outside the workspace) are allowed by construction: they are mounted
+			// read-only unless the user granted rw in *global* config, and writes
+			// are still mediated below. Blocking reads would make skills unusable
+			// inside the sandbox.
+			if (!request.write && !relInside && request.hostPath !== deps.cwd) return undefined;
 			const allowed =
 				deps.isAllowed(request.hostPath) || (relInside && deps.isAllowed(relPath));
 			if (allowed) return undefined;

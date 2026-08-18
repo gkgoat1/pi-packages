@@ -17,10 +17,12 @@
  * - `execGuest`: long-running guest processes with piped stdio (MCP servers).
  */
 
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { RealFSProvider, SandboxVfsProvider, type VM } from "@earendil-works/gondolin";
+import { ReadonlyProvider, RealFSProvider, SandboxVfsProvider, type VM } from "@earendil-works/gondolin";
 import type { VirtualProvider, VfsHookContext } from "@earendil-works/gondolin";
+import type { MountConfig } from "./config.ts";
 import { buildStubEnv, type DiscoveredSecret } from "./secrets.ts";
 import { GUEST_BASE_ENV, shQuote } from "./ops.ts";
 
@@ -77,12 +79,24 @@ export interface GuestExecSpec {
 	signal?: AbortSignal;
 }
 
+/** A configured extra mount, exposed to consumers (workspace excluded). */
+export interface SharedMountInfo {
+	/** Absolute host path. */
+	readonly hostPath: string;
+	/** Absolute guest path. */
+	readonly guestPath: string;
+	/** Mount access. */
+	readonly access: "ro" | "rw";
+}
+
 export interface GondolinShared {
 	readonly version: typeof GONDOLIN_SHARED_VERSION;
 	/** Host directory mounted read-write into the guest. */
 	readonly hostCwd: string;
 	/** Guest mount point for `hostCwd`. */
 	readonly guestWorkspace: string;
+	/** Extra host mounts (workspace excluded). */
+	readonly mounts: readonly SharedMountInfo[];
 	/** Whether the Gondolin extension resolved enabled for this session. */
 	isEnabled(): boolean;
 	/**
@@ -95,7 +109,7 @@ export interface GondolinShared {
 	ensureVm(): Promise<unknown>;
 	/** The running VM, or null while stopped. */
 	getVm(): unknown;
-	/** Map a host path under the workspace to its guest path, else undefined. */
+	/** Map a host path (under the workspace or any extra mount) to its guest path. */
 	toGuestPath(hostPath: string): string | undefined;
 	/**
 	 * Register a VM-filesystem guard for the workspace mount. The returned
@@ -314,6 +328,69 @@ export function launchGuestProcess(
 	});
 }
 
+/**
+ * Map a host path under the workspace or any extra mount to its guest path.
+ * Workspace is consulted first; extra mounts are matched by host prefix.
+ */
+export function mapHostToGuestPath(
+	hostCwd: string,
+	guestWorkspace: string,
+	mounts: readonly Pick<SharedMountInfo, "hostPath" | "guestPath">[],
+	hostPath: string,
+): string | undefined {
+	const viaWorkspace = hostPathToGuestPath(hostCwd, guestWorkspace, hostPath);
+	if (viaWorkspace) return viaWorkspace;
+	for (const mount of mounts) {
+		const rel = path.relative(mount.hostPath, hostPath);
+		if (rel === "") return mount.guestPath;
+		if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+			return path.posix.join(mount.guestPath, rel.split(path.sep).join("/"));
+		}
+	}
+	return undefined;
+}
+
+export interface ExtraMountBuild {
+	/** guest-path → provider map to merge into the VM vfs mounts. */
+	mounts: Record<string, VirtualProvider>;
+	/** Mounts skipped with a human-readable reason (for boot status). */
+	skipped: Array<{ hostPath: string; guestPath: string; reason: string }>;
+}
+
+/**
+ * Build VFS providers for the extra host mounts. Each is wrapped so File
+ * Guard's interception still applies (writes to rw extras are mediated;
+ * read-only mounts are additionally wrapped in `ReadonlyProvider`, which
+ * hard-blocks every mutating op with `EROFS` before any guard runs).
+ */
+export function buildExtraMountProviders(
+	configMounts: readonly MountConfig[],
+	guards: Set<GondolinFsGuard>,
+	opts?: { exists?: (path: string) => boolean },
+): ExtraMountBuild {
+	const exists = opts?.exists ?? existsSync;
+	const mounts: Record<string, VirtualProvider> = {};
+	const skipped: ExtraMountBuild["skipped"] = [];
+	for (const mount of configMounts) {
+		if (mounts[mount.guestPath]) {
+			skipped.push({ hostPath: mount.hostPath, guestPath: mount.guestPath, reason: "duplicate guest path" });
+			continue;
+		}
+		if (!exists(mount.hostPath)) {
+			skipped.push({ hostPath: mount.hostPath, guestPath: mount.guestPath, reason: "host path does not exist" });
+			continue;
+		}
+		const guarded = createGuardedWorkspaceProvider(
+			new RealFSProvider(mount.hostPath),
+			guards,
+			mount.hostPath,
+			mount.guestPath,
+		);
+		mounts[mount.guestPath] = mount.access === "ro" ? new ReadonlyProvider(guarded) : guarded;
+	}
+	return { mounts, skipped };
+}
+
 /** Publish the handle on globalThis (called by the Gondolin extension). */
 export function installGondolinShared(handle: GondolinShared): void {
 	(globalThis as Record<symbol, unknown>)[GONDOLIN_SHARED_KEY] = handle;
@@ -334,4 +411,4 @@ export function clearGondolinSharedForTest(): void {
 
 // Re-export so the extension entry can mount the guarded workspace provider
 // without importing RealFSProvider twice.
-export { RealFSProvider };
+export { RealFSProvider, ReadonlyProvider };

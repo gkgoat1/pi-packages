@@ -4,6 +4,10 @@
   "guestWorkspace": "/workspace",
   "allowedHosts": null,
   "envPassthrough": ["TZ"],
+  "mounts": {
+    "skills": "ro",
+    "~/reference-docs": { "access": "rw", "guestPath": "/docs" }
+  },
   "httpProxy": {
     "enabled": true,
     "discoverKnownSecrets": true,
