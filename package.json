@@ -1,7 +1,7 @@
 {
   "name": "pi-packages",
   "version": "0.1.0",
-  "description": "Pi extensions for file guards, routed workers, configurable MCP clients, thinking compression, and a Gondolin micro-VM sandbox",
+  "description": "Pi extensions for file guards, routed workers, configurable MCP clients, thinking compression, a Gondolin micro-VM sandbox, and sandboxed radare2 binary analysis",
   "keywords": [
     "pi-package",
     "pi",
@@ -11,7 +11,10 @@
     "thinking-compression",
     "gondolin",
     "sandbox",
-    "qemu"
+    "qemu",
+    "radare2",
+    "r2pipe",
+    "reverse-engineering"
   ],
   "license": "MIT",
   "type": "module",
@@ -22,7 +25,7 @@
     "check": "npx --yes --package typescript tsc --noEmit -p tsconfig.mcp.json",
     "build": "node scripts/build.mjs",
     "test": "node --import tsx --test",
-    "test:pi": "npm run build && node --test test/workers-bundle.test.mjs test/gondolin-bundle.test.mjs"
+    "test:pi": "npm run build && node --test test/workers-bundle.test.mjs test/gondolin-bundle.test.mjs test/radare2-bundle.test.mjs"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -42,7 +45,11 @@
       "./dist/mcp-client",
       "./dist/workers",
       "./dist/thinking-compression",
-      "./dist/gondolin"
+      "./dist/gondolin",
+      "./dist/radare2"
+    ],
+    "skills": [
+      "./dist/radare2/skills/radare2"
     ]
   },
   "dependencies": {

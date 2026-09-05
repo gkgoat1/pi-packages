@@ -115,3 +115,23 @@ for (const [out, info] of entries) {
 	const rel = out.replace(/^(.*?\/dist\/)/, "dist/");
 	console.log(`  ${rel}  ${Math.round(info.bytes / 1024)}KB`);
 }
+
+/**
+ * Copy verbatim resources that must ship next to a bundle:
+ * - extensions/radare2/src/sandbox/radare2.sb → dist/radare2/radare2.sb
+ *   (the Seatbelt wrapper resolves the profile relative to its bundle).
+ * - skills/radare2/** → dist/radare2/skills/radare2/** (registered via the
+ *   `pi.skills` entry in package.json).
+ */
+import { cpSync, existsSync as existsSync2 } from "node:fs";
+
+const r2ProfileSrc = join(extensionsDir, "radare2", "src", "sandbox", "radare2.sb");
+if (existsSync2(r2ProfileSrc)) {
+	cpSync(r2ProfileSrc, join(outDir, "radare2", "radare2.sb"));
+	console.log("  dist/radare2/radare2.sb (seatbelt profile)");
+}
+const r2SkillSrc = join(root, "skills", "radare2");
+if (existsSync2(r2SkillSrc)) {
+	cpSync(r2SkillSrc, join(outDir, "radare2", "skills", "radare2"), { recursive: true });
+	console.log("  dist/radare2/skills/radare2 (skill)");
+}

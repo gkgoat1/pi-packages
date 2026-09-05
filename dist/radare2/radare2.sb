@@ -1,0 +1,130 @@
+;; radare2.sb — Dedicated Seatbelt profile for the Pi radare2 extension
+;;
+;; Policy (my.sb-inspired, fail-closed):
+;;   deny default → broad reads minus secrets → write allowlist (tmp + project)
+;;
+;; Parameters (injected via sandbox-exec -D):
+;;   HOME  — user home directory
+;;   PROJ  — resolved project working directory
+;;   TMP   — temp directory for r2 scratch files (history, projects, caches)
+;;
+;; Note: (param ...) inside (require-all)/(require-not) filters triggers
+;; "invalid data type of path filter" on current macOS, so the wrapper
+;; substitutes the parameter values textually before invoking sandbox-exec.
+;; The profile below therefore expects literal paths in place of PARAM_*.
+
+(version 1)
+(deny default)
+
+;; ---------------------------------------------------------------------------
+;; Process & system essentials (my.sb)
+;; ---------------------------------------------------------------------------
+(allow process-exec)
+(allow process-fork)
+(allow process-info*)
+(allow signal)
+(allow mach*)
+(allow sysctl*)
+(allow ipc-posix-shm*)
+(allow ipc-posix-sem*)
+(allow iokit-open)
+(allow system-socket)
+(allow system-fsctl)
+(allow pseudo-tty)
+(allow user-preference-read)
+(allow file-ioctl)
+
+;; ---------------------------------------------------------------------------
+;; Network — allowed (r2 remote modes, plugin fetches); egress is a documented
+;; property of this profile and is additionally gated by allowRemote.
+;; ---------------------------------------------------------------------------
+(allow network*)
+
+;; ---------------------------------------------------------------------------
+;; Read access — global allow, then deny secrets (my.sb, trimmed to what an
+;; RE tool can plausibly need; config/known_hosts/public keys stay readable)
+;; ---------------------------------------------------------------------------
+(allow file-read*)
+
+;; -- Cryptographic keys: block private keys, keep config/known_hosts/*.pub --
+(deny file-read*
+  (require-all
+    (subpath "PARAM_HOME/.ssh")
+    (require-not (literal "PARAM_HOME/.ssh/config"))
+    (require-not (literal "PARAM_HOME/.ssh/known_hosts"))
+    (require-not (literal "PARAM_HOME/.ssh/known_hosts.old"))
+    (require-not (regex "^PARAM_HOME_QUOTED/\\.ssh/.*\\.pub$"))
+  ))
+
+(deny file-read* (subpath "PARAM_HOME/.gnupg"))
+
+;; -- Cloud providers: allow configs, deny credentials --
+(deny file-read*
+  (require-all
+    (subpath "PARAM_HOME/.aws")
+    (require-not (literal "PARAM_HOME/.aws/config"))
+  ))
+(deny file-read* (literal "PARAM_HOME/.aws/credentials"))
+
+(deny file-read* (subpath "PARAM_HOME/.docker"))
+(deny file-read* (subpath "PARAM_HOME/.kube"))
+
+;; -- Version control tokens --
+(deny file-read*
+  (require-all
+    (subpath "PARAM_HOME/.config/gh")
+    (require-not (literal "PARAM_HOME/.config/gh/config.yml"))
+  ))
+(deny file-read* (literal "PARAM_HOME/.config/gh/hosts.yml"))
+
+;; -- Package manager tokens --
+(deny file-read* (literal "PARAM_HOME/.pypirc"))
+(deny file-read* (literal "PARAM_HOME/.npmrc"))
+(deny file-read* (literal "PARAM_HOME/.cargo/credentials.toml"))
+(deny file-read* (literal "PARAM_HOME/.netrc"))
+
+;; -- Privacy & secrets --
+(deny file-read* (regex "^PARAM_HOME_QUOTED/\\..*_history$"))
+(deny file-read* (literal "PARAM_HOME/.env"))
+(deny file-read* (literal "PARAM_HOME/.zhistory"))
+(deny file-read* (subpath "PARAM_HOME/.zsh"))
+
+;; -- macOS sensitive data: Keychain stays readable (Security.framework is
+;; touched during Mach-O/entitlement parsing); Safari denied --
+(deny file-read* (subpath "PARAM_HOME/Library/Safari"))
+
+;; -- Browser profiles --
+(deny file-read* (subpath "PARAM_HOME/Library/Application Support/Google/Chrome"))
+(deny file-read* (subpath "PARAM_HOME/Library/Application Support/Zen"))
+
+;; ---------------------------------------------------------------------------
+;; Write access — deny-default, explicit allowlist only
+;; ---------------------------------------------------------------------------
+(allow file-write* (subpath "PARAM_TMP"))
+(allow file-write* (subpath "/private/var/folders/"))
+(allow file-write* (subpath "/private/tmp/"))
+(allow file-write* (subpath "PARAM_PROJ"))
+(allow file-write* (subpath "/dev/"))
+
+;; ---------------------------------------------------------------------------
+;; Mandatory write denies — defense-in-depth (my.sb)
+;; ---------------------------------------------------------------------------
+(deny file-write* (subpath "PARAM_HOME/.ssh"))
+(deny file-write* (subpath "PARAM_HOME/.gnupg"))
+(deny file-write* (literal "PARAM_HOME/.gitconfig"))
+(deny file-write* (literal "PARAM_HOME/.zshrc"))
+(deny file-write* (literal "PARAM_HOME/.bashrc"))
+(deny file-write* (literal "PARAM_HOME/.profile"))
+(deny file-write* (literal "PARAM_HOME/.zprofile"))
+(deny file-write* (literal "PARAM_HOME/.zshenv"))
+(deny file-write* (literal "PARAM_HOME/.zlogout"))
+(deny file-write* (literal "PARAM_HOME/.bash_profile"))
+(deny file-write* (subpath "PARAM_PROJ/.git/hooks"))
+(deny file-write* (literal "PARAM_PROJ/.git/config"))
+(deny file-write* (literal "PARAM_PROJ/.gitconfig"))
+(deny file-write* (subpath "PARAM_PROJ/.vscode"))
+(deny file-write* (subpath "PARAM_PROJ/.idea"))
+
+;; Extra denies injected from config (sandbox.extraSeatbeltDenies),
+;; appended verbatim by the wrapper before this marker:
+;; EXTRA_DENIES
