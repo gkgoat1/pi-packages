@@ -14,7 +14,8 @@
     "qemu",
     "radare2",
     "r2pipe",
-    "reverse-engineering"
+    "reverse-engineering",
+    "tool-output"
   ],
   "license": "MIT",
   "type": "module",
@@ -46,7 +47,8 @@
       "./dist/workers",
       "./dist/thinking-compression",
       "./dist/gondolin",
-      "./dist/radare2"
+      "./dist/radare2",
+      "./dist/tool-output-limit"
     ],
     "skills": [
       "./dist/radare2/skills/radare2"
