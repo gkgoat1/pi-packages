@@ -30,17 +30,14 @@ export default function toolOutputLimit(pi: ExtensionAPI) {
 		}
 	};
 
-	// Tool definitions are fixed for an extension runtime. Read the trusted project
-	// configuration during load so an enabled extension can replace bash; /reload
-	// applies later changes.
-	refresh(process.cwd(), true);
-	if (!error && config.enabled) {
-		registerBashOverride(pi, config);
-		registerReadOverride(pi, config);
-	}
-
+	let toolsRegistered = false;
 	pi.on("session_start", (_event, ctx) => {
 		refresh(ctx.cwd, ctx.isProjectTrusted());
+		if (!error && config.enabled && !toolsRegistered) {
+			registerBashOverride(pi, config);
+			registerReadOverride(pi, config);
+			toolsRegistered = true;
+		}
 		if (ctx.hasUI && error) ctx.ui.notify(`tool-output-limit disabled: ${error}`, "error");
 	});
 

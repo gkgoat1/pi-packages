@@ -4744,13 +4744,14 @@ function toolOutputLimit(pi) {
       error = cause instanceof Error ? cause.message : String(cause);
     }
   };
-  refresh(process.cwd(), true);
-  if (!error && config.enabled) {
-    registerBashOverride(pi, config);
-    registerReadOverride(pi, config);
-  }
+  let toolsRegistered = false;
   pi.on("session_start", (_event, ctx) => {
     refresh(ctx.cwd, ctx.isProjectTrusted());
+    if (!error && config.enabled && !toolsRegistered) {
+      registerBashOverride(pi, config);
+      registerReadOverride(pi, config);
+      toolsRegistered = true;
+    }
     if (ctx.hasUI && error) ctx.ui.notify(`tool-output-limit disabled: ${error}`, "error");
   });
   pi.registerCommand("tool-output-limit", {
