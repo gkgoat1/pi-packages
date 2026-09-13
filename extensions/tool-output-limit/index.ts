@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ConfigError, loadConfig, limitsFor, TOOL_NAMES, type ToolOutputLimitConfig } from "./src/config.ts";
 import { registerBashOverride } from "./src/bash.ts";
+import { registerReadOverride } from "./src/read.ts";
 
 function status(config: ToolOutputLimitConfig): string {
 	const format = (value: number | null) => value === null ? "unlimited" : `${value.toLocaleString()}`;
@@ -33,7 +34,10 @@ export default function toolOutputLimit(pi: ExtensionAPI) {
 	// configuration during load so an enabled extension can replace bash; /reload
 	// applies later changes.
 	refresh(process.cwd(), true);
-	if (!error && config.enabled) registerBashOverride(pi, config);
+	if (!error && config.enabled) {
+		registerBashOverride(pi, config);
+		registerReadOverride(pi, config);
+	}
 
 	pi.on("session_start", (_event, ctx) => {
 		refresh(ctx.cwd, ctx.isProjectTrusted());
