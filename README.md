@@ -7,6 +7,7 @@ A single installable Pi package that bundles:
 - **MCP Client** — disabled until its configuration explicitly enables the configurable stdio MCP bridge.
 - **Thinking Compression** — disabled until its config explicitly enables compression of finalized Pi thinking blocks; see [`extensions/thinking-compression/README.md`](extensions/thinking-compression/README.md).
 - **Gondolin Sandbox** — disabled until its config explicitly enables the QEMU micro-VM tool sandbox with credential-stub HTTP proxying; see [`extensions/gondolin/README.md`](extensions/gondolin/README.md). The running VM is published as a symbol-keyed global handle (`Symbol.for("pi-packages.gondolin.shared")`) so the other extensions reuse it without a dependency: File Guard switches to VM-filesystem interception instead of restricting tools, and MCP servers run inside the VM (opt-out via `"inVm": false`) — each only when both extensions are enabled.
+- **Tool Output Limit** — disabled until enabled explicitly; raises the `bash` and `read` text-output caps for proxy/compression setups such as llmtrim. See [`extensions/tool-output-limit/README.md`](extensions/tool-output-limit/README.md).
 
 ## Install
 
@@ -29,6 +30,7 @@ Each extension is also runtime-disabled by default, so enabling it with `pi conf
 - Workers: set `"enabled": true` in the target project's `.pi/workers.json`; start from [`examples/workers.json.example`](examples/workers.json.example) and see [`extensions/workers/README.md`](extensions/workers/README.md).
 - MCP Client: set top-level `"enabled": true` in its config or `PI_MCP_CLIENT_CONFIG`; see [`extensions/mcp-client/README.md`](extensions/mcp-client/README.md) and [`examples/mcp-client.json.example`](examples/mcp-client.json.example).
 - Gondolin Sandbox: set `"enabled": true` in its config or `PI_GONDOLIN_ENABLED=true` (QEMU required; `accel` defaults to `tcg` for nested VMs); see [`extensions/gondolin/README.md`](extensions/gondolin/README.md) and [`examples/gondolin.json.example`](examples/gondolin.json.example).
+- Tool Output Limit: set `"enabled": true` in `~/.pi/agent/tool-output-limit.json` or a trusted `.pi/tool-output-limit.json`; see [`extensions/tool-output-limit/README.md`](extensions/tool-output-limit/README.md).
 
 ## Deferred migration
 
