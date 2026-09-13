@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ConfigError, loadConfig, limitsFor, TOOL_NAMES, type ToolOutputLimitConfig } from "./src/config.ts";
+import { registerBashOverride } from "./src/bash.ts";
 
 function status(config: ToolOutputLimitConfig): string {
 	const format = (value: number | null) => value === null ? "unlimited" : `${value.toLocaleString()}`;
@@ -15,7 +16,7 @@ function status(config: ToolOutputLimitConfig): string {
 }
 
 export default function toolOutputLimit(pi: ExtensionAPI) {
-	let config: ToolOutputLimitConfig;
+	let config: ToolOutputLimitConfig = { enabled: false, maxBytes: 0, maxLines: 0, hardMaxBytes: 0, tools: {}, tempOutput: { retain: true, directory: null } };
 	let error: string | undefined;
 
 	const refresh = (cwd: string, trusted: boolean) => {
@@ -27,6 +28,12 @@ export default function toolOutputLimit(pi: ExtensionAPI) {
 			error = cause instanceof Error ? cause.message : String(cause);
 		}
 	};
+
+	// Tool definitions are fixed for an extension runtime. Read the trusted project
+	// configuration during load so an enabled extension can replace bash; /reload
+	// applies later changes.
+	refresh(process.cwd(), true);
+	if (!error && config.enabled) registerBashOverride(pi, config);
 
 	pi.on("session_start", (_event, ctx) => {
 		refresh(ctx.cwd, ctx.isProjectTrusted());
