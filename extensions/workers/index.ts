@@ -130,6 +130,11 @@ const SteerParams = Type.Object({
 	delivery: Type.Optional(StringEnum(["steer", "followUp"] as const, { default: "steer" })),
 });
 
+const ReplyParams = Type.Object({
+	workerId: Type.String({ description: "Worker id returned by workers_spawn, including a finished or errored one" }),
+	message: Type.String({ description: "Follow-up message for the worker" }),
+});
+
 function textResult(text: string, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text }], details };
 }
@@ -492,6 +497,94 @@ function channelForProcess(proc: ChildProcessWithoutNullStreams): WorkerChannel 
 	return channelByProcess.get(proc);
 }
 
+type ControlMode = "reply" | "steer";
+
+interface DeliveryOutcome {
+	/** sent = live RPC delivery; queued = relayed to the owner process; resumed = restarted and delivered; rejected = refused. */
+	kind: "sent" | "queued" | "resumed" | "rejected";
+	detail: string;
+}
+
+interface DeliveryDeps {
+	cwd: string;
+	config: WorkersConfig;
+	extensionPath: string;
+	/** The current worker id when this process is itself a worker (root: undefined). */
+	ownWorkerId?: string;
+}
+
+function terminalStatus(record: WorkerRecord): boolean {
+	return ["error", "aborted", "exited"].includes(record.status);
+}
+
+/** Kill every worker process this process owns; used by session shutdown and test cleanup. */
+async function stopWorkerProcesses(): Promise<void> {
+	const live = [...ownedProcesses.values()];
+	for (const proc of live) {
+		if (processIsLive(proc)) proc.kill("SIGTERM");
+	}
+	await Promise.all(live.map((proc) => (
+		proc.exitCode === null && proc.signalCode === null
+			? new Promise((resolve) => proc.once("exit", resolve))
+			: undefined
+	)));
+}
+
+/**
+ * The single validator behind workers_reply, workers_steer, and the /workers
+ * command. Own children are addressed over their RPC channel; nested workers
+ * are reached by a forward control to the process that owns their stdin.
+ */
+async function deliverToWorker(runtimeDir: string, workerId: string, message: string, mode: ControlMode, deps: DeliveryDeps): Promise<DeliveryOutcome> {
+	if (message.length > MAX_OUTPUT_CHARS) return { kind: "rejected", detail: `Message exceeds ${MAX_OUTPUT_CHARS} characters.` };
+	const record = await readRecord(runtimeDir, workerId);
+	if (!record) throw new Error(`Unknown worker: ${workerId}`);
+	const terminal = terminalStatus(record);
+
+	const ownChild = record.parentId === deps.ownWorkerId || (!deps.ownWorkerId && record.parentId === null);
+	if (!ownChild && record.parentId) {
+		// Nested: the parent process owns the child's stdin. Steer on an ended
+		// worker is meaningless; relay the rest and let the owner resume it.
+		if (mode === "steer" && terminal) {
+			return { kind: "rejected", detail: `Worker ${workerId} is ${record.status}; nothing to steer. Use workers_reply to resume it.` };
+		}
+		const parent = await readRecord(runtimeDir, record.parentId);
+		if (!parent) return { kind: "rejected", detail: `Parent worker ${record.parentId} is unknown; cannot reach ${workerId}.` };
+		const parentProc = ownedProcesses.get(ownedKey(runtimeDir, parent.id));
+		if (terminalStatus(parent) && !processIsLive(parentProc)) {
+			// Revive the parent (no message) so its poll loop picks up the control.
+			await resumeWorker(runtimeDir, parent.id, { cwd: deps.cwd, config: deps.config, extensionPath: deps.extensionPath });
+		}
+		await appendControl(runtimeDir, parent.id, {
+			type: "forward",
+			targetWorkerId: workerId,
+			inner: { type: mode === "steer" ? "steer" : terminal ? "prompt" : "follow_up", message },
+		});
+		return { kind: "queued", detail: `Relayed ${mode} to ${workerId} through its parent ${parent.id}.` };
+	}
+
+	const proc = ownedProcesses.get(ownedKey(runtimeDir, workerId));
+	if (processIsLive(proc)) {
+		const channel = channelForProcess(proc);
+		if (!channel) return { kind: "rejected", detail: `Worker ${workerId} has no RPC channel.` };
+		const streaming = record.status === "starting" || record.status === "running";
+		const command: Record<string, unknown> = mode === "steer" && streaming
+			? { type: "steer", message }
+			: streaming
+				? { type: "follow_up", message }
+				: { type: "prompt", message };
+		const response = await channel.send(command);
+		if (response.success !== true) return { kind: "rejected", detail: `Worker ${workerId} rejected the command: ${String(response.error ?? "unknown")}` };
+		const disposition = isObject(response.data) && typeof response.data.disposition === "string" ? response.data.disposition : "accepted";
+		return { kind: "sent", detail: `${String(command.type)} delivered to ${workerId} (${disposition}).` };
+	}
+	if (mode === "steer" && terminal) {
+		return { kind: "rejected", detail: `Worker ${workerId} is ${record.status}; nothing to steer. Use workers_reply to resume it.` };
+	}
+	const resumed = await resumeWorker(runtimeDir, workerId, { cwd: deps.cwd, config: deps.config, extensionPath: deps.extensionPath, message });
+	return { kind: "resumed", detail: `Resumed ${workerId} (attempt ${resumed.record.attempts ?? "?"}) and delivered the ${mode}.` };
+}
+
 interface ForwardOutcome {
 	kind: "applied" | "rejected";
 	detail: string;
@@ -810,7 +903,6 @@ export default function workersExtension(pi: ExtensionAPI) {
 	const lockedConfig = configFromEnvironment();
 	let currentModel: string | undefined;
 	let controlTimer: ReturnType<typeof setInterval> | undefined;
-	const childProcesses = ownedProcesses;
 
 	const installGuestEventMap = () => {
 		if (!ownWorkerId) return;
@@ -954,8 +1046,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		processGlobals[EXTENSION_INSTANCE_SYMBOL] = undefined;
 		if (controlTimer) clearInterval(controlTimer);
-		for (const child of childProcesses.values()) child.kill("SIGTERM");
-		childProcesses.clear();
+		await stopWorkerProcesses();
 		if (ownWorkerId) {
 			await appendWorkerEvent(runtimeDir, ownWorkerId, "lifecycle", "session_shutdown", {});
 			await updateWorkerOutput(runtimeDir, ownWorkerId, undefined, "exited");
@@ -1006,12 +1097,27 @@ export default function workersExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "workers_reply", label: "Workers: Reply",
+		description: "Send a normal follow-up message to any worker, including a nested, finished, or errored one. Live workers queue it as a follow-up; ended workers resume on their own session first.",
+		parameters: ReplyParams,
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const config = await getConfig(ctx.cwd);
+			const outcome = await deliverToWorker(runtimeDir, params.workerId, params.message, "reply", { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
+			if (outcome.kind === "rejected") throw new Error(outcome.detail);
+			return textResult(outcome.detail, { workerId: params.workerId, outcome });
+		},
+	});
+
+	pi.registerTool({
 		name: "workers_steer", label: "Workers: Steer",
-		description: "Send an instruction to any live worker, including a nested worker. 'steer' is delivered after its current tool batch; 'followUp' waits until it settles.",
+		description: "Send an instruction to any live worker, including a nested worker. 'steer' is delivered after its current tool batch; 'followUp' waits until it settles. Ended workers are rejected — use workers_reply to resume them.",
 		parameters: SteerParams,
-		async execute(_id, params) {
-			await appendControl(runtimeDir, params.workerId, { type: "prompt", message: params.message, delivery: params.delivery ?? "steer" });
-			return textResult(`Queued ${params.delivery ?? "steer"} instruction for worker ${params.workerId}.`, { workerId: params.workerId });
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const config = await getConfig(ctx.cwd);
+			const mode = params.delivery === "followUp" ? "reply" : "steer";
+			const outcome = await deliverToWorker(runtimeDir, params.workerId, params.message, mode, { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
+			if (outcome.kind === "rejected") throw new Error(outcome.detail);
+			return textResult(outcome.detail, { workerId: params.workerId, outcome });
 		},
 	});
 
@@ -1064,4 +1170,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, channelForProcess, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, channelForProcess, controlFileFor, deliverToWorker, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
