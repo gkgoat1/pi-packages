@@ -4695,6 +4695,62 @@ async function resolvePendingDialog(runtimeDir, workerId, requestId, outcome, de
   });
   return true;
 }
+function uiResponseForMethod(method, response) {
+  if ("cancelled" in response && response.cancelled === true) return { cancelled: true };
+  if (method === "confirm") return "confirmed" in response && typeof response.confirmed === "boolean" ? { confirmed: response.confirmed } : void 0;
+  if (["select", "input", "editor"].includes(method)) return "value" in response && typeof response.value === "string" ? { value: response.value } : void 0;
+  return void 0;
+}
+async function dialogPendingInEvents(runtimeDir, workerId, requestId) {
+  const { events } = await readWorkerEvents(runtimeDir, workerId, 0, 100);
+  let method;
+  for (const event of events) {
+    if (event.kind !== "ui") continue;
+    if (event.type === "ui_request" && isObject(event.data) && event.data.id === requestId && typeof event.data.method === "string") method = event.data.method;
+    if (event.type === "ui_answered" && isObject(event.data) && event.data.id === requestId) method = void 0;
+  }
+  return method ? { method } : void 0;
+}
+async function deliverUiAnswer(runtimeDir, workerId, requestId, response, deps) {
+  const record = await readRecord(runtimeDir, workerId);
+  if (!record) throw new Error(`Unknown worker: ${workerId}`);
+  const ownChild = record.parentId === deps.ownWorkerId || !deps.ownWorkerId && record.parentId === null;
+  let method;
+  if (ownChild) {
+    const entry = pendingDialogs.get(pendingKey(runtimeDir, workerId))?.get(requestId);
+    method = entry?.method ?? (await dialogPendingInEvents(runtimeDir, workerId, requestId))?.method;
+  } else {
+    method = (await dialogPendingInEvents(runtimeDir, workerId, requestId))?.method;
+  }
+  if (!method) return { kind: "rejected", detail: `No pending dialog ${requestId} on worker ${workerId} (stale or already answered).` };
+  const shaped = uiResponseForMethod(method, response);
+  if (!shaped) return { kind: "rejected", detail: `Answer shape does not match the ${method} dialog on worker ${workerId}.` };
+  if (!ownChild && record.parentId) {
+    const parent = await readRecord(runtimeDir, record.parentId);
+    if (!parent) return { kind: "rejected", detail: `Parent worker ${record.parentId} is unknown; cannot reach ${workerId}.` };
+    const parentProc = ownedProcesses.get(ownedKey(runtimeDir, parent.id));
+    if (terminalStatus(parent) && !processIsLive(parentProc)) {
+      return { kind: "rejected", detail: `Parent ${parent.id} is ${parent.status}; dialog ${requestId} is gone with its child process.` };
+    }
+    await appendControl(runtimeDir, parent.id, {
+      type: "forward",
+      targetWorkerId: workerId,
+      inner: { type: "ui_response", requestId, response: shaped }
+    });
+    return { kind: "queued", detail: `Relayed dialog answer ${requestId} to ${workerId} through its parent ${parent.id}.` };
+  }
+  const proc = ownedProcesses.get(ownedKey(runtimeDir, workerId));
+  if (!processIsLive(proc)) return { kind: "rejected", detail: `Worker ${workerId} is not running; dialog ${requestId} is gone.` };
+  try {
+    proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: requestId, ...shaped })}
+`);
+  } catch (error) {
+    return { kind: "rejected", detail: `Failed to write the dialog answer: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const cancelled = shaped.cancelled === true;
+  await resolvePendingDialog(runtimeDir, workerId, requestId, cancelled ? "cancelled" : "answered", cancelled ? "cancelled by dashboard" : `${method} answered`);
+  return { kind: "sent", detail: `Dialog ${requestId} on ${workerId} ${cancelled ? "cancelled" : "answered"}.` };
+}
 function classifyUiRequest(record) {
   const id = typeof record.id === "string" ? record.id : void 0;
   const method = typeof record.method === "string" ? record.method : void 0;
@@ -4923,10 +4979,29 @@ async function applyForwardControl(runtimeDir, ownerId, control, deps) {
     return { kind: "rejected", detail: detail2 };
   };
   if (!target) return fail("forward control is missing targetWorkerId");
-  if (!inner || !["steer", "follow_up", "prompt", "abort"].includes(inner.type)) return fail(`forward to ${target}: unsupported inner control type`);
+  if (!inner || !["steer", "follow_up", "prompt", "abort", "ui_response"].includes(inner.type)) return fail(`forward to ${target}: unsupported inner control type`);
   if (inner.message !== void 0 && inner.message.length > MAX_OUTPUT_CHARS) return fail(`forward to ${target}: message exceeds ${MAX_OUTPUT_CHARS} characters`);
   const record = await readRecord(runtimeDir, target);
   if (!record || record.parentId !== ownerId) return fail(`forward target ${target} is not a child of ${ownerId}`);
+  if (inner.type === "ui_response") {
+    const requestId = typeof inner.requestId === "string" ? inner.requestId : void 0;
+    if (!requestId || !isObject(inner.response)) return fail(`forward to ${target}: ui_response needs a requestId and a response`);
+    const childProc = ownedProcesses.get(ownedKey(runtimeDir, target));
+    if (!processIsLive(childProc)) return fail(`forward target ${target} is not running; dialog ${requestId} is gone`);
+    const pending = pendingDialogs.get(pendingKey(runtimeDir, target))?.get(requestId);
+    if (!pending) return fail(`no pending dialog ${requestId} on ${target}`);
+    try {
+      childProc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: requestId, ...inner.response })}
+`);
+    } catch (error) {
+      return fail(`forward to ${target} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const cancelled = inner.response.cancelled === true;
+    await resolvePendingDialog(runtimeDir, target, requestId, cancelled ? "cancelled" : "answered", `relayed by ${ownerId}`);
+    const detail2 = `dialog ${requestId} ${cancelled ? "cancelled" : "answered"} on ${target}`;
+    await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: "applied", detail: detail2 });
+    return { kind: "applied", detail: detail2 };
+  }
   const proc = ownedProcesses.get(ownedKey(runtimeDir, target));
   if (processIsLive(proc)) {
     const channel = channelForProcess(proc);
@@ -5477,6 +5552,7 @@ export {
   controlFileFor,
   workersExtension as default,
   deliverToWorker,
+  deliverUiAnswer,
   offsetFileFor,
   pendingDialogsFor,
   readAppliedControls,
