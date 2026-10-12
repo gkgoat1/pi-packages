@@ -60,7 +60,10 @@ Workers are ordinary persisted Pi sessions, with normal project/global extension
 - `workers_spawn({ tag, task, name?, wait? })` starts a policy-authorized worker.
 - `workers_query({ workerId, tail? })` reads a worker's durable Pi transcript; use `workerId: "all"` for the tree.
 - `workers_listen({ workerId, since?, limit? })` reads retained live Pi and guest events and returns `nextCursor`.
-- `workers_steer({ workerId, message, delivery? })` sends a `steer` instruction after the current tool batch or a `followUp` after it settles.
+- `workers_steer({ workerId, message, delivery? })` redirects a live worker: `steer` after the current tool batch, `followUp` after it settles. Ended workers are rejected — use `workers_reply`.
+- `workers_reply({ workerId, message })` sends a normal follow-up to any worker: queued as a follow-up while it runs, started as a new run while it idles, and finished or errored workers resume on their own pinned session first.
+
+Every worker pins one append-only Pi session (`<runtime>/sessions/<id>.jsonl`), so a resume continues the same transcript under the same worker id — never a linked replacement and never a transcript edit. Controls for nested workers are relayed to the process that owns the child; a dead parent is revived (without a message) so its journal picks up the relay.
 
 The root, any parent, and the user can query, listen to, steer, and abort nested workers by id. Use `/workers` for the equivalent interactive interface:
 
@@ -69,9 +72,13 @@ The root, any parent, and the user can query, listen to, steer, and abort nested
 /workers query <worker-id>
 /workers listen <worker-id> [cursor]
 /workers spawn <tag> <task>
+/workers reply <worker-id> <message>
 /workers steer <worker-id> <message>
+/workers resume <worker-id>
 /workers abort <worker-id>
 ```
+
+Delivery results say what happened: `sent` (live RPC delivery), `queued` (relayed to the owner process), `resumed` (restarted on its session), or a rejection with the reason. `/workers resume` restarts a direct child without a message; for a nested worker, reply and its parent will resume it.
 
 ## Transcripts and guest events
 

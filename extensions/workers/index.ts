@@ -552,7 +552,13 @@ async function deliverToWorker(runtimeDir: string, workerId: string, message: st
 		if (!parent) return { kind: "rejected", detail: `Parent worker ${record.parentId} is unknown; cannot reach ${workerId}.` };
 		const parentProc = ownedProcesses.get(ownedKey(runtimeDir, parent.id));
 		if (terminalStatus(parent) && !processIsLive(parentProc)) {
-			// Revive the parent (no message) so its poll loop picks up the control.
+			// Revive the parent (no message) so its poll loop picks up the control —
+			// but only when this process owns it. A dead grandparent must be revived
+			// from its own nearest live ancestor, never resurrected wholesale here.
+			const parentIsOwnChild = parent.parentId === deps.ownWorkerId || (!deps.ownWorkerId && parent.parentId === null);
+			if (!parentIsOwnChild) {
+				return { kind: "rejected", detail: `Worker ${workerId} is unreachable: parent ${parent.id} is ${parent.status} and not a direct child of this process. Revive ${parent.id} first.` };
+			}
 			await resumeWorker(runtimeDir, parent.id, { cwd: deps.cwd, config: deps.config, extensionPath: deps.extensionPath });
 		}
 		await appendControl(runtimeDir, parent.id, {
@@ -1122,7 +1128,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("workers", {
-		description: "Manage workers: status [id|all], query <id>, listen <id> [cursor], spawn <tag> <task>, steer <id> <message>, abort <id>",
+		description: "Manage workers: status [id|all], query <id>, listen <id> [cursor], spawn <tag> <task>, reply <id> <message>, steer <id> <message>, resume <id>, abort <id>",
 		handler: async (args, ctx) => {
 			const [action = "status", first, ...rest] = args.trim().split(/\s+/);
 			if (action === "status") {
@@ -1144,10 +1150,23 @@ export default function workersExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`${events.map((event) => `[${event.seq}] ${event.kind}:${event.type} ${JSON.stringify(event.data)}`).join("\n") || "No events."}\nnextCursor: ${nextCursor}`, "info");
 				return;
 			}
-			if (action === "steer") {
-				if (!first || rest.length === 0) throw new Error("Usage: /workers steer <worker-id> <message>");
-				await appendControl(runtimeDir, first, { type: "prompt", message: rest.join(" "), delivery: "steer" });
-				ctx.ui.notify(`Steering message queued for ${first}.`, "info");
+			if (action === "steer" || action === "reply") {
+				if (!first || rest.length === 0) throw new Error(`Usage: /workers ${action} <worker-id> <message>`);
+				const config = await getConfig(ctx.cwd);
+				const outcome = await deliverToWorker(runtimeDir, first, rest.join(" "), action, { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
+				if (outcome.kind === "rejected") throw new Error(outcome.detail);
+				ctx.ui.notify(outcome.detail, outcome.kind === "resumed" ? "warning" : "info");
+				return;
+			}
+			if (action === "resume") {
+				if (!first) throw new Error("Usage: /workers resume <worker-id>");
+				const record = await readRecord(runtimeDir, first);
+				if (!record) throw new Error(`Unknown worker: ${first}`);
+				const ownChild = record.parentId === ownWorkerId || (!ownWorkerId && record.parentId === null);
+				if (!ownChild) throw new Error(`Worker ${first} is nested; use /workers reply ${first} <message> and its parent will resume it.`);
+				const config = await getConfig(ctx.cwd);
+				const resumed = await resumeWorker(runtimeDir, first, { cwd: ctx.cwd, config, extensionPath });
+				ctx.ui.notify(`Resumed ${first} (attempt ${resumed.record.attempts ?? "?"}).`, "info");
 				return;
 			}
 			if (action === "abort") {
@@ -1162,7 +1181,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(worker ? `Worker started.\n${summarize(worker)}` : "Worker launch failed before a status record was available.", "info");
 				return;
 			}
-			throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | steer <id> <message> | abort <id>");
+			throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | abort <id>");
 		},
 	});
 }

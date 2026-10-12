@@ -116,6 +116,22 @@ test("steer on a streaming worker delivers the steer command", async () => {
 	});
 });
 
+test("a dead nested parent that is not an own child is rejected with revive guidance", async () => {
+	const runtimeDir = await mkdtemp(join(tmpdir(), "pi-workers-tools-"));
+	try {
+		const grandparent = { ...makeRecord(runtimeDir, "gp0001", {}), parentId: "top001", status: "error", initialTaskPersisted: true };
+		const child = { ...makeRecord(runtimeDir, "kid001", {}), parentId: "gp0001", status: "error", initialTaskPersisted: true };
+		await writeRecord(runtimeDir, grandparent);
+		await writeRecord(runtimeDir, child);
+		const deps = { cwd: root, config, extensionPath: fixturePath };
+		const outcome = await deliverToWorker(runtimeDir, "kid001", "continue", "reply", deps);
+		assert.equal(outcome.kind, "rejected");
+		assert.match(outcome.detail, /Revive gp0001 first/);
+	} finally {
+		await rm(runtimeDir, { recursive: true, force: true });
+	}
+});
+
 test("an unknown worker id throws before any process is touched", async () => {
 	const runtimeDir = await mkdtemp(join(tmpdir(), "pi-workers-tools-"));
 	try {
