@@ -13,8 +13,10 @@ First prove Pi's RPC UI protocol and explicit-session resume with a fake worker.
 Then make workers resumable, add supported UI passthrough and a TUI dashboard,
 replace `mcp-client` with built-in MCP, and validate `@gkgo/pi-packages` as a
 tarball. The largest cost is the worker control path across nested processes.
-Do not publish or silently drop Gondolin's in-VM MCP behavior. Review the package
-slug, dashboard shape, and in-VM MCP decision before implementation.
+Each extension additionally ships as its own `@gkgo` package so users can
+install just one. Do not publish or silently drop Gondolin's in-VM MCP
+behavior. Review the package slug, dashboard shape, and in-VM MCP decision
+before implementation.
 
 ## Scope and vocabulary
 
@@ -24,7 +26,7 @@ slug, dashboard shape, and in-VM MCP decision before implementation.
 - **Resume** means reopening the same Pi session file for the same worker ID.
 - **UI passthrough** means forwarding Pi's supported RPC extension UI records.
 - **Dashboard** means a parent Pi TUI screen, not a web server.
-- `@gkgo` applies to this package name only.
+- `@gkgo` applies to the bundle package and each per-extension package name.
 - `@earendil-works/*` remains the host Pi API namespace.
 
 ## Current state and constraints
@@ -50,6 +52,7 @@ transient.
 ## Review gates
 
 1. Confirm that `@gkgo/pi-packages` is the desired scoped package slug.
+2. Confirm the per-extension package slugs (for example `@gkgo/pi-workers`).
 2. Confirm that the dashboard should be a parent Pi TUI screen.
 3. Confirm that supported RPC UI methods are enough for the first release.
 4. Confirm whether `ctx.ui.custom()` needs a new protocol.
@@ -59,7 +62,8 @@ transient.
 
 The default choices in this plan are a TUI dashboard, supported RPC UI only,
 retirement of the old in-VM MCP path unless separately approved, live-runtime
-resume, and no publish.
+resume, per-extension packages named `@gkgo/pi-<name>` mirroring the manifest
+entries, and no publish.
 
 ## 1. Requirements
 
@@ -68,6 +72,7 @@ resume, and no publish.
 - **R-3 Upgrade to the latest Pi with worker compatibility** — user request; current lock and local Pi baseline.
 - **R-4 Remove `mcp-client` and use built-in Pi MCP** — user request; Pi built-in MCP documentation.
 - **R-5 Publishable `@gkgo` scoped package metadata** — user request; npm package requirements.
+- **R-7 Selectively installable per-extension `@gkgo` packages** — user request; Pi package discovery rules.
 - **R-6 Preserve worker policy, transcript, and security guarantees** — current Workers README; repository security instructions.
 
 ## 2. The approach, requirement by requirement
@@ -156,6 +161,29 @@ resume, and no publish.
   - [ ] A dry-run publish passes without publishing to the registry.
 - **Hard part**: The scope may be unavailable or require npm ownership.
   Peer dependency installation must still resolve through Pi's host packages.
+
+### R-7 Selectively installable per-extension `@gkgo` packages
+
+- **Approach**: Ship every extension as its own public scoped package
+  (`@gkgo/pi-file-guard`, `@gkgo/pi-workers`, `@gkgo/pi-thinking-compression`,
+  `@gkgo/pi-gondolin`, `@gkgo/pi-radare2`, `@gkgo/pi-tool-output-limit`)
+  alongside the `@gkgo/pi-packages` bundle. Each per-extension package carries
+  its own manifest, README, and built bundle, so a user installs only what
+  they enable.
+- **Touches**: Build script, package layout, per-extension manifests and docs.
+- **Test seam**: A tarball matrix — pack and temp-install each package, then
+  load its bundle under the target Pi.
+- **Acceptance**:
+  - [ ] Every manifest extension entry has exactly one matching `@gkgo/pi-<name>` package.
+  - [ ] Each package's `pi.extensions` points only at its own bundle.
+  - [ ] `@gkgo/pi-gondolin` declares `@earendil-works/gondolin` as its runtime dependency.
+  - [ ] Every package declares the same Pi host peers and Node floor as the bundle.
+  - [ ] A temp install of each package loads with no missing-module errors.
+  - [ ] The bundle package keeps working unchanged for users who want everything.
+  - [ ] Shared-resource packages document cross-extension symbol contracts they honor.
+- **Hard part**: One repo now publishes a family of packages; versioning,
+  tarball contents, and cross-extension symbol contracts (the Gondolin shared
+  handle) must stay consistent without a monorepo migration.
 
 ### R-6 Preserve worker policy, transcript, and security guarantees
 
@@ -314,9 +342,33 @@ the dashboard, resumes an errored session, and passes the full test suite.
 
 **Not here**: Registry ownership changes, credential setup, or `npm publish`.
 
+### Phase 7 — Split selectively installable per-extension packages
+
+**Covers**: R-7 Selectively installable per-extension `@gkgo` packages,
+R-5 Publishable `@gkgo` scoped package metadata, and R-6 Preserve worker
+policy, transcript, and security guarantees.
+
+**Goal**: Each extension packs, installs, and loads on its own under the
+`@gkgo` scope, while the bundle package still ships everything.
+
+**Tasks**
+
+- Choose the per-package layout (generated package dirs or npm workspaces) without moving sources
+- Generate one manifest, README, and tarball per extension with matching peers and Node floor
+- Keep `@earendil-works/gondolin` a runtime dependency of only `@gkgo/pi-gondolin`
+- Document cross-extension contracts (Gondolin shared handle) honored across packages
+- Run the pack/install/load matrix for every package under the target Pi
+- Extend the release checklist with per-package publish dry runs, still without publishing
+
+**Proof**: A script installs each `@gkgo/pi-<name>` tarball into a clean
+project and Pi loads that extension alone with no missing-module errors.
+
+**Not here**: Monorepo tooling migration, version decoupling policy, or `npm publish`.
+
 ## Cross-phase release checklist
 
 - [ ] Reviewer approves the package slug and release version.
+- [ ] Reviewer approves the per-extension package slugs and layout.
 - [ ] Reviewer approves the TUI dashboard scope.
 - [ ] Reviewer approves the supported RPC UI method boundary.
 - [ ] Reviewer approves the in-VM MCP disposition.
@@ -326,9 +378,12 @@ the dashboard, resumes an errored session, and passes the full test suite.
 - [ ] `npm test` passes.
 - [ ] `npm run test:pi` passes.
 - [ ] Tarball inspection finds no credentials or unwanted local files.
+- [ ] The per-extension pack/install/load matrix passes for every `@gkgo/pi-<name>` package.
 - [ ] No registry publish occurs without a separate approval.
 
 ## Changelog
 
+- 2026-10-12 — Added R-7 and Phase 7: each extension also ships as its own
+  `@gkgo/pi-<name>` package so users can install extensions selectively.
 - 2026-10-12 — Created the draft plan from the current worker architecture,
   Pi `1.1.0` RPC and MCP capabilities, and the requested scoped release.
