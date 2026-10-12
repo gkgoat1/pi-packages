@@ -20,10 +20,10 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.19.0"
   },
   "scripts": {
-    "check": "npx --yes --package typescript tsc --noEmit -p tsconfig.mcp.json",
+    "check": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.mcp.json",
     "build": "node scripts/build.mjs",
     "test": "node --import tsx --test",
     "test:pi": "npm run build && node --test test/workers-bundle.test.mjs test/gondolin-bundle.test.mjs test/radare2-bundle.test.mjs"
