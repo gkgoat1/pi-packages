@@ -29,6 +29,7 @@ test("Gondolin bundle publishes the shared handle for other bundles in Pi", asyn
 	// symbol-keyed global from the same Pi process. This is the contract File
 	// Guard and the MCP client rely on for their VM integrations.
 	const directory = await mkdtemp(join(tmpdir(), "pi-gondolin-shared-"));
+	const isolatedHome = await mkdtemp(join(tmpdir(), "pi-gondolin-home-"));
 	const probeOut = join(directory, "probe-out.json");
 	try {
 		await writeFile(
@@ -51,7 +52,7 @@ test("Gondolin bundle publishes the shared handle for other bundles in Pi", asyn
 			["--no-extensions", "--extension", gondolinBundle, "--extension", join(directory, "index.mjs"), "-p", "/gondolin"],
 			{
 				cwd: root,
-				env: { ...process.env, PROBE_OUT: probeOut },
+				env: { ...process.env, HOME: isolatedHome, PROBE_OUT: probeOut, PI_GONDOLIN_CONFIG: "" },
 				stdio: ["ignore", "ignore", "pipe"],
 			},
 		);
@@ -67,5 +68,6 @@ test("Gondolin bundle publishes the shared handle for other bundles in Pi", asyn
 		assert.fail(`Shared-handle probe failed: ${error.stderr ?? error.message}`);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
+		await rm(isolatedHome, { recursive: true, force: true });
 	}
 });
