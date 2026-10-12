@@ -4742,6 +4742,49 @@ ${rendered.slice(-MAX_TRANSCRIPT_CHARS)}` : rendered || "Transcript contains no 
     return `Unable to read transcript ${record.sessionFile}: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
+function createWorkerChannel(proc) {
+  const pending = /* @__PURE__ */ new Map();
+  let closed = false;
+  const channel = {
+    get closed() {
+      return closed;
+    },
+    send(command) {
+      if (closed || proc.exitCode !== null || proc.signalCode !== null) {
+        return Promise.reject(new Error("Worker process is not running; the command cannot be delivered."));
+      }
+      const id = typeof command.id === "string" ? command.id : `rpc-${randomUUID()}`;
+      const record = { ...command, id };
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        proc.stdin.write(`${JSON.stringify(record)}
+`, (error) => {
+          if (error) {
+            pending.delete(id);
+            reject(error);
+          }
+        });
+      });
+    },
+    handleRecord(record) {
+      if (record.type !== "response" || typeof record.id !== "string") return;
+      const waiter = pending.get(record.id);
+      if (!waiter) return;
+      pending.delete(record.id);
+      waiter.resolve(record);
+    },
+    failAll(reason) {
+      closed = true;
+      for (const waiter of pending.values()) waiter.reject(new Error(reason));
+      pending.clear();
+    }
+  };
+  return channel;
+}
+var channelByProcess = /* @__PURE__ */ new WeakMap();
+function channelForProcess(proc) {
+  return channelByProcess.get(proc);
+}
 function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath) {
   const invocation = piInvocation(workerInvocationArgs(record, extensionPath));
   const proc = spawn(invocation.command, invocation.args, {
@@ -4756,6 +4799,8 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
       PI_WORKERS_CONFIG: Buffer.from(JSON.stringify(config)).toString("base64url")
     }
   });
+  const channel = createWorkerChannel(proc);
+  channelByProcess.set(proc, channel);
   void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_started", { pid: proc.pid, invocation: [invocation.command, ...invocation.args] });
   let buffer = "";
   proc.stdout.on("data", (chunk) => {
@@ -4766,6 +4811,7 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
       buffer = buffer.slice(newline + 1);
       try {
         const event = JSON.parse(line);
+        channel.handleRecord(event);
         void appendWorkerEvent(runtimeDir, record.id, "pi", typeof event.type === "string" ? event.type : "unknown", event);
         if (event.type === "response" && event.command === "prompt" && event.id === `initial-${record.id}`) {
           if (event.success === true) void markInitialTaskPersisted(runtimeDir, record.id);
@@ -4787,10 +4833,12 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
   let stderr = "";
   proc.stderr.on("data", (chunk) => stderr += chunk.toString("utf8"));
   proc.on("error", (error) => {
+    channel.failAll(`Worker process errored: ${error.message}`);
     void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_error", { message: error.message });
     void updateWorkerOutput(runtimeDir, record.id, void 0, "error", error.message);
   });
   proc.on("exit", (code, signal) => {
+    channel.failAll(`Worker process exited (${signal ?? code ?? "unknown"}); outstanding commands were not answered.`);
     void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_exit", { code, signal, stderr: stderr.slice(-4e3) });
     void (async () => {
       await mutateRecord(runtimeDir, record.id, (current) => {
@@ -5159,6 +5207,7 @@ export {
   abortWorker,
   acknowledgeControl,
   appendControl,
+  channelForProcess,
   controlFileFor,
   workersExtension as default,
   offsetFileFor,

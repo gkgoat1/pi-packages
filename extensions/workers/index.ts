@@ -436,6 +436,56 @@ async function transcriptSummary(record: WorkerRecord, tail: number): Promise<st
 	}
 }
 
+interface WorkerChannel {
+	readonly closed: boolean;
+	send(command: Record<string, unknown>): Promise<Record<string, unknown>>;
+	handleRecord(record: Record<string, unknown>): void;
+	failAll(reason: string): void;
+}
+
+/** Correlate stdin commands to stdout `response` records for one child process. */
+function createWorkerChannel(proc: ChildProcessWithoutNullStreams): WorkerChannel {
+	const pending = new Map<string, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
+	let closed = false;
+	const channel: WorkerChannel = {
+		get closed() { return closed; },
+		send(command) {
+			if (closed || proc.exitCode !== null || proc.signalCode !== null) {
+				return Promise.reject(new Error("Worker process is not running; the command cannot be delivered."));
+			}
+			const id = typeof command.id === "string" ? command.id : `rpc-${randomUUID()}`;
+			const record = { ...command, id };
+			return new Promise((resolve, reject) => {
+				pending.set(id, { resolve, reject });
+				proc.stdin.write(`${JSON.stringify(record)}\n`, (error) => {
+					if (error) {
+						pending.delete(id);
+						reject(error);
+					}
+				});
+			});
+		},
+		handleRecord(record) {
+			if (record.type !== "response" || typeof record.id !== "string") return;
+			const waiter = pending.get(record.id);
+			if (!waiter) return;
+			pending.delete(record.id);
+			waiter.resolve(record);
+		},
+		failAll(reason) {
+			closed = true;
+			for (const waiter of pending.values()) waiter.reject(new Error(reason));
+			pending.clear();
+		},
+	};
+	return channel;
+}
+
+const channelByProcess = new WeakMap<ChildProcessWithoutNullStreams, WorkerChannel>();
+function channelForProcess(proc: ChildProcessWithoutNullStreams): WorkerChannel | undefined {
+	return channelByProcess.get(proc);
+}
+
 function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConfig, record: WorkerRecord, task: string | undefined, extensionPath: string): ChildProcessWithoutNullStreams {
 	// Do NOT use --no-session or --no-extensions. A worker has its own persisted
 	// Pi transcript and normal project/global extensions, plus this extension.
@@ -454,6 +504,8 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 			PI_WORKERS_CONFIG: Buffer.from(JSON.stringify(config)).toString("base64url"),
 		},
 	});
+	const channel = createWorkerChannel(proc);
+	channelByProcess.set(proc, channel);
 	void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_started", { pid: proc.pid, invocation: [invocation.command, ...invocation.args] });
 	let buffer = "";
 	proc.stdout.on("data", (chunk: Buffer) => {
@@ -464,6 +516,7 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 			buffer = buffer.slice(newline + 1);
 			try {
 				const event = JSON.parse(line);
+				channel.handleRecord(event);
 				void appendWorkerEvent(runtimeDir, record.id, "pi", typeof event.type === "string" ? event.type : "unknown", event);
 				if (event.type === "response" && event.command === "prompt" && event.id === `initial-${record.id}`) {
 					if (event.success === true) void markInitialTaskPersisted(runtimeDir, record.id);
@@ -487,10 +540,12 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 	let stderr = "";
 	proc.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
 	proc.on("error", (error) => {
+		channel.failAll(`Worker process errored: ${error.message}`);
 		void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_error", { message: error.message });
 		void updateWorkerOutput(runtimeDir, record.id, undefined, "error", error.message);
 	});
 	proc.on("exit", (code, signal) => {
+		channel.failAll(`Worker process exited (${signal ?? code ?? "unknown"}); outstanding commands were not answered.`);
 		void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_exit", { code, signal, stderr: stderr.slice(-4000) });
 		void (async () => {
 			await mutateRecord(runtimeDir, record.id, (current) => {
@@ -857,4 +912,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, channelForProcess, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };
