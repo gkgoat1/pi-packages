@@ -4637,6 +4637,64 @@ function workerInvocationArgs(record, extensionPath) {
 }
 var UI_DIALOG_METHODS = /* @__PURE__ */ new Set(["select", "confirm", "input", "editor"]);
 var UI_NOTIFY_METHODS = /* @__PURE__ */ new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]);
+var MAX_PENDING_DIALOGS = 64;
+var pendingDialogs = /* @__PURE__ */ new Map();
+function pendingKey(runtimeDir, workerId) {
+  return `${runtimeDir}\0${workerId}`;
+}
+async function pendingDialogsFor(runtimeDir, workerId) {
+  const store = pendingDialogs.get(pendingKey(runtimeDir, workerId));
+  return store ? [...store.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt)) : [];
+}
+async function registerPendingDialog(runtimeDir, workerId, payload, proc) {
+  const requestId = typeof payload.id === "string" ? payload.id : void 0;
+  const method = typeof payload.method === "string" ? payload.method : "unknown";
+  if (!requestId) {
+    await appendWorkerEvent(runtimeDir, workerId, "ui", "ui_rejected", { method, reason: "dialog request is missing an id" });
+    return;
+  }
+  const key = pendingKey(runtimeDir, workerId);
+  let store = pendingDialogs.get(key);
+  if (!store) {
+    store = /* @__PURE__ */ new Map();
+    pendingDialogs.set(key, store);
+  }
+  if (store.has(requestId)) {
+    store.delete(requestId);
+    await appendWorkerEvent(runtimeDir, workerId, "ui", "ui_answered", { id: requestId, method, outcome: "replaced", reason: "duplicate request id" });
+  }
+  if (store.size >= MAX_PENDING_DIALOGS) {
+    if (proc && processIsLive(proc)) {
+      try {
+        proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: requestId, cancelled: true })}
+`);
+      } catch {
+      }
+    }
+    await appendWorkerEvent(runtimeDir, workerId, "ui", "ui_answered", { id: requestId, method, outcome: "cancelled", reason: `pending dialog cap (${MAX_PENDING_DIALOGS})` });
+    return;
+  }
+  store.set(requestId, {
+    workerId,
+    requestId,
+    method,
+    createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+    ...typeof payload.title === "string" ? { title: payload.title } : {}
+  });
+}
+async function resolvePendingDialog(runtimeDir, workerId, requestId, outcome, detail) {
+  const store = pendingDialogs.get(pendingKey(runtimeDir, workerId));
+  const entry = store?.get(requestId);
+  if (!entry) return false;
+  store.delete(requestId);
+  await appendWorkerEvent(runtimeDir, workerId, "ui", "ui_answered", {
+    id: requestId,
+    method: entry.method,
+    outcome,
+    ...detail ? { detail: detail.slice(0, 500) } : {}
+  });
+  return true;
+}
 function classifyUiRequest(record) {
   const id = typeof record.id === "string" ? record.id : void 0;
   const method = typeof record.method === "string" ? record.method : void 0;
@@ -4985,6 +5043,7 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
             void appendWorkerEvent(runtimeDir, record.id, "ui", "ui_rejected", ui.payload);
           } else {
             void appendWorkerEvent(runtimeDir, record.id, "ui", "ui_request", ui.payload);
+            if (ui.category === "dialog") void registerPendingDialog(runtimeDir, record.id, ui.payload, proc);
           }
           continue;
         }
@@ -5419,10 +5478,13 @@ export {
   workersExtension as default,
   deliverToWorker,
   offsetFileFor,
+  pendingDialogsFor,
   readAppliedControls,
   readControlOffset,
   readRecord,
   readWorkerEvents,
+  registerPendingDialog,
+  resolvePendingDialog,
   resumeWorker,
   sessionFileFor,
   startWorkerProcess,

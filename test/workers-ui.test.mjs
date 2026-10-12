@@ -7,7 +7,7 @@ import test from "node:test";
 const root = resolve(import.meta.dirname, "..");
 const fixturePath = join(root, "fixtures", "fake-rpc-worker.mjs");
 
-const { classifyUiRequest, readWorkerEvents, sessionFileFor, startWorkerProcess, stopWorkerProcesses, writeRecord } = await import("../extensions/workers/index.ts");
+const { classifyUiRequest, pendingDialogsFor, readWorkerEvents, registerPendingDialog, resolvePendingDialog, sessionFileFor, startWorkerProcess, stopWorkerProcesses, writeRecord } = await import("../extensions/workers/index.ts");
 
 const config = { maxDepth: 2, maxWorkers: 4, models: {} };
 
@@ -119,5 +119,63 @@ test("plain session events keep the pi kind alongside ui events", async () => {
 		const agentStart = events.find((event) => event.type === "agent_start");
 		assert.equal(agentStart?.kind, "pi");
 		assert.ok(events.every((event) => event.kind !== "ui" || event.data?.method !== undefined), "ui events always carry a method");
+	});
+});
+
+test("a dialog request registers as pending with worker id and method", async () => {
+	await withWorker("ui00006", "emit-ui-dialogs", async ({ runtimeDir, proc, workerId }) => {
+		await waitFor(async () => (await pendingDialogsFor(runtimeDir, workerId)).length === 1);
+		const pending = await pendingDialogsFor(runtimeDir, workerId);
+		assert.equal(pending[0]?.workerId, workerId);
+		assert.equal(pending[0]?.method, "select");
+		assert.equal(pending[0]?.title, "Allow dangerous command?");
+		assert.ok(pending[0]?.requestId, "request id retained");
+		proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: pending[0].requestId, cancelled: true })}\n`);
+	});
+});
+
+test("resolving a pending dialog removes it and emits ui_answered", async () => {
+	await withWorker("ui00007", "emit-ui-dialogs", async ({ runtimeDir, proc, workerId }) => {
+		await waitFor(async () => (await pendingDialogsFor(runtimeDir, workerId)).length === 1);
+		const pending = await pendingDialogsFor(runtimeDir, workerId);
+		const resolved = await resolvePendingDialog(runtimeDir, workerId, pending[0].requestId, "answered", "value: Allow");
+		assert.equal(resolved, true);
+		assert.equal((await pendingDialogsFor(runtimeDir, workerId)).length, 0);
+		await waitFor(async () => {
+			const { events } = await readWorkerEvents(runtimeDir, workerId);
+			return events.some((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.id === pending[0].requestId);
+		});
+		proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: pending[0].requestId, cancelled: true })}\n`);
+	});
+});
+
+test("the 65th pending dialog on one worker is auto-cancelled, not stored", async () => {
+	await withWorker("ui00008", "hello", async ({ runtimeDir, workerId }) => {
+		for (let index = 0; index < 64; index++) {
+			await registerPendingDialog(runtimeDir, workerId, { id: `dlg-${index}`, method: "select", category: "dialog" });
+		}
+		assert.equal((await pendingDialogsFor(runtimeDir, workerId)).length, 64);
+		await registerPendingDialog(runtimeDir, workerId, { id: "dlg-64", method: "confirm", category: "dialog" });
+		const pending = await pendingDialogsFor(runtimeDir, workerId);
+		assert.equal(pending.length, 64, "the cap holds");
+		assert.equal(pending.some((entry) => entry.requestId === "dlg-64"), false, "the overflow entry is not stored");
+		await waitFor(async () => {
+			const { events } = await readWorkerEvents(runtimeDir, workerId);
+			return events.some((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.id === "dlg-64" && event.data?.outcome === "cancelled");
+		});
+	});
+});
+
+test("a duplicate request id replaces the older entry with a note", async () => {
+	await withWorker("ui00009", "hello", async ({ runtimeDir, workerId }) => {
+		await registerPendingDialog(runtimeDir, workerId, { id: "dup-1", method: "select", category: "dialog", title: "first" });
+		await registerPendingDialog(runtimeDir, workerId, { id: "dup-1", method: "confirm", category: "dialog", title: "second" });
+		const pending = await pendingDialogsFor(runtimeDir, workerId);
+		assert.equal(pending.length, 1);
+		assert.equal(pending[0]?.method, "confirm", "the newer request wins");
+		await waitFor(async () => {
+			const { events } = await readWorkerEvents(runtimeDir, workerId);
+			return events.some((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.outcome === "replaced");
+		});
 	});
 });
