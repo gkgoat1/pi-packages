@@ -66,6 +66,9 @@ interface WorkerRecord {
 	initialTask?: string;
 	/** True once the child accepted the initial prompt; a resume must not send it again. */
 	initialTaskPersisted?: boolean;
+	/** Process attempts, counting the original launch; incremented by each resume. */
+	attempts?: number;
+	lastResumedAt?: string;
 	lastOutput?: string;
 	error?: string;
 	pid?: number;
@@ -484,6 +487,92 @@ function createWorkerChannel(proc: ChildProcessWithoutNullStreams): WorkerChanne
 const channelByProcess = new WeakMap<ChildProcessWithoutNullStreams, WorkerChannel>();
 function channelForProcess(proc: ChildProcessWithoutNullStreams): WorkerChannel | undefined {
 	return channelByProcess.get(proc);
+}
+
+interface ResumeOptions {
+	cwd: string;
+	config: WorkersConfig;
+	extensionPath: string;
+	/** Optional reply to deliver once the worker is running again. */
+	message?: string;
+	/** Caller-known live handle; resuming a live worker is a caller bug. */
+	liveProcess?: ChildProcessWithoutNullStreams;
+}
+
+interface ResumeResult {
+	/** "resumed" = a new process attempt started; "sent" = the message delivered into an existing one. */
+	outcome: "resumed" | "sent";
+	process: ChildProcessWithoutNullStreams;
+	record: WorkerRecord;
+}
+
+const ownedProcesses = new Map<string, ChildProcessWithoutNullStreams>();
+const resumesInFlight = new Map<string, Promise<ResumeResult>>();
+
+function processIsLive(proc: ChildProcessWithoutNullStreams | undefined): proc is ChildProcessWithoutNullStreams {
+	return Boolean(proc && proc.exitCode === null && proc.signalCode === null);
+}
+
+/**
+ * Restart an ended worker on its own pinned session and optionally deliver a
+ * reply. Never replays an already-persisted initial task, never creates a
+ * second process while one attempt is live or starting.
+ */
+async function resumeWorker(runtimeDir: string, workerId: string, options: ResumeOptions): Promise<ResumeResult> {
+	const key = `${runtimeDir}\u0000${workerId}`;
+	const owned = ownedProcesses.get(key);
+	if (processIsLive(owned) || processIsLive(options.liveProcess)) {
+		const proc = (processIsLive(owned) ? owned : options.liveProcess)!;
+		if (processIsLive(options.liveProcess) && !processIsLive(owned)) {
+			throw new Error(`Worker ${workerId} is live (pid ${proc.pid}); steer or reply through the live channel instead of resuming.`);
+		}
+		if (options.message) await channelForProcess(proc)?.send({ type: "prompt", id: `reply-${randomUUID()}`, message: options.message });
+		const record = await readRecord(runtimeDir, workerId);
+		return { outcome: "sent", process: proc, record: record! };
+	}
+	const inFlight = resumesInFlight.get(key);
+	if (inFlight) {
+		const started = await inFlight;
+		if (options.message) await channelForProcess(started.process)?.send({ type: "prompt", id: `reply-${randomUUID()}`, message: options.message });
+		return { ...started, outcome: "sent" };
+	}
+	const record = await readRecord(runtimeDir, workerId);
+	if (!record) throw new Error(`Unknown worker: ${workerId}`);
+	if (record.status === "starting" || record.status === "running") {
+		throw new Error(`Worker ${workerId} is ${record.status}; steer or reply through the live channel instead of resuming.`);
+	}
+	const resume = (async (): Promise<ResumeResult> => {
+		const attempts = (record.attempts ?? 1) + 1;
+		const updated = await mutateRecord(runtimeDir, workerId, (current) => {
+			current.status = "starting";
+			current.attempts = attempts;
+			current.lastResumedAt = new Date().toISOString();
+		});
+		await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "worker_resumed", { attempt: attempts, message: options.message ? true : false });
+		// Replaying an accepted initial task would duplicate it in the transcript;
+		// an unpersisted one must be delivered or the worker never got its task.
+		const task = record.initialTaskPersisted ? undefined : record.initialTask;
+		const proc = startWorkerProcess(options.cwd, runtimeDir, options.config, updated ?? record, task, options.extensionPath);
+		ownedProcesses.set(key, proc);
+		proc.on("exit", () => {
+			if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
+		});
+		if (options.message) {
+			const channel = channelForProcess(proc);
+			// The original task goes as the initial prompt; the reply queues behind it.
+			const command = task !== undefined
+				? { type: "follow_up", id: `reply-${randomUUID()}`, message: options.message }
+				: { type: "prompt", id: `reply-${randomUUID()}`, message: options.message };
+			await channel?.send(command);
+		}
+		return { outcome: "resumed", process: proc, record: (await readRecord(runtimeDir, workerId)) ?? record };
+	})();
+	resumesInFlight.set(key, resume);
+	try {
+		return await resume;
+	} finally {
+		if (resumesInFlight.get(key) === resume) resumesInFlight.delete(key);
+	}
 }
 
 function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConfig, record: WorkerRecord, task: string | undefined, extensionPath: string): ChildProcessWithoutNullStreams {
@@ -912,4 +1001,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, channelForProcess, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, channelForProcess, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };

@@ -4785,6 +4785,62 @@ var channelByProcess = /* @__PURE__ */ new WeakMap();
 function channelForProcess(proc) {
   return channelByProcess.get(proc);
 }
+var ownedProcesses = /* @__PURE__ */ new Map();
+var resumesInFlight = /* @__PURE__ */ new Map();
+function processIsLive(proc) {
+  return Boolean(proc && proc.exitCode === null && proc.signalCode === null);
+}
+async function resumeWorker(runtimeDir, workerId, options) {
+  const key = `${runtimeDir}\0${workerId}`;
+  const owned = ownedProcesses.get(key);
+  if (processIsLive(owned) || processIsLive(options.liveProcess)) {
+    const proc = processIsLive(owned) ? owned : options.liveProcess;
+    if (processIsLive(options.liveProcess) && !processIsLive(owned)) {
+      throw new Error(`Worker ${workerId} is live (pid ${proc.pid}); steer or reply through the live channel instead of resuming.`);
+    }
+    if (options.message) await channelForProcess(proc)?.send({ type: "prompt", id: `reply-${randomUUID()}`, message: options.message });
+    const record2 = await readRecord(runtimeDir, workerId);
+    return { outcome: "sent", process: proc, record: record2 };
+  }
+  const inFlight = resumesInFlight.get(key);
+  if (inFlight) {
+    const started = await inFlight;
+    if (options.message) await channelForProcess(started.process)?.send({ type: "prompt", id: `reply-${randomUUID()}`, message: options.message });
+    return { ...started, outcome: "sent" };
+  }
+  const record = await readRecord(runtimeDir, workerId);
+  if (!record) throw new Error(`Unknown worker: ${workerId}`);
+  if (record.status === "starting" || record.status === "running") {
+    throw new Error(`Worker ${workerId} is ${record.status}; steer or reply through the live channel instead of resuming.`);
+  }
+  const resume = (async () => {
+    const attempts = (record.attempts ?? 1) + 1;
+    const updated = await mutateRecord(runtimeDir, workerId, (current) => {
+      current.status = "starting";
+      current.attempts = attempts;
+      current.lastResumedAt = (/* @__PURE__ */ new Date()).toISOString();
+    });
+    await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "worker_resumed", { attempt: attempts, message: options.message ? true : false });
+    const task = record.initialTaskPersisted ? void 0 : record.initialTask;
+    const proc = startWorkerProcess(options.cwd, runtimeDir, options.config, updated ?? record, task, options.extensionPath);
+    ownedProcesses.set(key, proc);
+    proc.on("exit", () => {
+      if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
+    });
+    if (options.message) {
+      const channel = channelForProcess(proc);
+      const command = task !== void 0 ? { type: "follow_up", id: `reply-${randomUUID()}`, message: options.message } : { type: "prompt", id: `reply-${randomUUID()}`, message: options.message };
+      await channel?.send(command);
+    }
+    return { outcome: "resumed", process: proc, record: await readRecord(runtimeDir, workerId) ?? record };
+  })();
+  resumesInFlight.set(key, resume);
+  try {
+    return await resume;
+  } finally {
+    if (resumesInFlight.get(key) === resume) resumesInFlight.delete(key);
+  }
+}
 function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath) {
   const invocation = piInvocation(workerInvocationArgs(record, extensionPath));
   const proc = spawn(invocation.command, invocation.args, {
@@ -5215,6 +5271,7 @@ export {
   readControlOffset,
   readRecord,
   readWorkerEvents,
+  resumeWorker,
   sessionFileFor,
   startWorkerProcess,
   workerInvocationArgs,
