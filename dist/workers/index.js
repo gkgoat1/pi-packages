@@ -4635,6 +4635,20 @@ function workerInvocationArgs(record, extensionPath) {
     extensionPath
   ];
 }
+var UI_DIALOG_METHODS = /* @__PURE__ */ new Set(["select", "confirm", "input", "editor"]);
+var UI_NOTIFY_METHODS = /* @__PURE__ */ new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]);
+function classifyUiRequest(record) {
+  const id = typeof record.id === "string" ? record.id : void 0;
+  const method = typeof record.method === "string" ? record.method : void 0;
+  const category = method && UI_DIALOG_METHODS.has(method) ? "dialog" : method && UI_NOTIFY_METHODS.has(method) ? "fireAndForget" : "unsupported";
+  if (category === "unsupported") {
+    return { category, id, method, payload: { id, method, reason: "unsupported extension UI method" } };
+  }
+  const { type: _type, id: _id, method: _method, ...fields } = record;
+  const bounded = safeEventData(fields);
+  const payload = isObject(bounded) && bounded.truncated === true ? { id, method, category, truncated: true, originalBytes: bounded.originalBytes, preview: typeof bounded.preview === "string" ? bounded.preview.slice(0, 2e3) : "" } : isObject(bounded) ? { id, method, category, ...bounded } : { id, method, category, value: bounded };
+  return { category, id, method, payload };
+}
 function safeEventData(value) {
   try {
     const text = JSON.stringify(value);
@@ -4965,6 +4979,15 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
       try {
         const event = JSON.parse(line);
         channel.handleRecord(event);
+        if (event.type === "extension_ui_request") {
+          const ui = classifyUiRequest(event);
+          if (ui.category === "unsupported") {
+            void appendWorkerEvent(runtimeDir, record.id, "ui", "ui_rejected", ui.payload);
+          } else {
+            void appendWorkerEvent(runtimeDir, record.id, "ui", "ui_request", ui.payload);
+          }
+          continue;
+        }
         void appendWorkerEvent(runtimeDir, record.id, "pi", typeof event.type === "string" ? event.type : "unknown", event);
         if (event.type === "response" && event.command === "prompt" && event.id === `initial-${record.id}`) {
           if (event.success === true) void markInitialTaskPersisted(runtimeDir, record.id);
@@ -5391,6 +5414,7 @@ export {
   appendControl,
   applyForwardControl,
   channelForProcess,
+  classifyUiRequest,
   controlFileFor,
   workersExtension as default,
   deliverToWorker,

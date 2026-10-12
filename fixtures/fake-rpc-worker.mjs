@@ -97,6 +97,14 @@ function handlePrompt(command) {
 		dialogSequence = dialogSequence.then(runDialogSequence);
 	} else if (message === "emit-ui-fire-and-forget") {
 		runFireAndForget();
+	} else if (message === "emit-ui-unknown") {
+		requestUi("hologram", { title: "Unsupported method" });
+		write({ type: "agent_start" });
+		settle(false);
+	} else if (message === "emit-ui-oversized") {
+		requestUi("setWidget", { widgetKey: "fake-worker", widgetLines: ["x".repeat(200_000)], widgetPlacement: "aboveEditor" });
+		write({ type: "agent_start" });
+		settle(false);
 	} else if (message === "long-task") {
 		streaming = true;
 		write({ type: "agent_start" });

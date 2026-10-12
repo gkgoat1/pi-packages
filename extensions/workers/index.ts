@@ -101,7 +101,7 @@ interface WorkerEvent {
 	seq: number;
 	timestamp: string;
 	workerId: string;
-	kind: "pi" | "guest" | "lifecycle";
+	kind: "pi" | "guest" | "lifecycle" | "ui";
 	type: string;
 	data: unknown;
 }
@@ -334,6 +334,45 @@ function workerInvocationArgs(record: WorkerRecord, extensionPath: string): stri
 }
 
 type SafeEventData = string | number | boolean | null | unknown[] | { [key: string]: unknown };
+
+const UI_DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
+const UI_NOTIFY_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]);
+
+type UiCategory = "dialog" | "fireAndForget" | "unsupported";
+
+interface UiClassification {
+	category: UiCategory;
+	id?: string;
+	method?: string;
+	/** Renderable payload; id and method survive even when the rest is truncated. */
+	payload: Record<string, unknown>;
+}
+
+/**
+ * Classify a raw `extension_ui_request` record against the RPC-supported method
+ * set. Anything outside the allowlist is unsupported — never treated as a
+ * dialog, so no worker can block on a record the dashboard cannot answer.
+ */
+function classifyUiRequest(record: Record<string, unknown>): UiClassification {
+	const id = typeof record.id === "string" ? record.id : undefined;
+	const method = typeof record.method === "string" ? record.method : undefined;
+	const category: UiCategory = method && UI_DIALOG_METHODS.has(method) ? "dialog"
+		: method && UI_NOTIFY_METHODS.has(method) ? "fireAndForget"
+		: "unsupported";
+	if (category === "unsupported") {
+		return { category, id, method, payload: { id, method, reason: "unsupported extension UI method" } };
+	}
+	const { type: _type, id: _id, method: _method, ...fields } = record;
+	const bounded = safeEventData(fields);
+	const payload = isObject(bounded) && bounded.truncated === true
+		// Keep the identity fields readable by shrinking the preview far below the
+		// outer 64 KiB event cap, which would otherwise re-truncate and drop them.
+		? { id, method, category, truncated: true, originalBytes: bounded.originalBytes, preview: typeof bounded.preview === "string" ? bounded.preview.slice(0, 2000) : "" }
+		: isObject(bounded)
+			? { id, method, category, ...bounded }
+			: { id, method, category, value: bounded };
+	return { category, id, method, payload };
+}
 
 function safeEventData(value: unknown): SafeEventData {
 	try {
@@ -765,6 +804,15 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 			try {
 				const event = JSON.parse(line);
 				channel.handleRecord(event);
+				if (event.type === "extension_ui_request") {
+					const ui = classifyUiRequest(event);
+					if (ui.category === "unsupported") {
+						void appendWorkerEvent(runtimeDir, record.id, "ui", "ui_rejected", ui.payload);
+					} else {
+						void appendWorkerEvent(runtimeDir, record.id, "ui", "ui_request", ui.payload);
+					}
+					continue;
+				}
 				void appendWorkerEvent(runtimeDir, record.id, "pi", typeof event.type === "string" ? event.type : "unknown", event);
 				if (event.type === "response" && event.command === "prompt" && event.id === `initial-${record.id}`) {
 					if (event.success === true) void markInitialTaskPersisted(runtimeDir, record.id);
@@ -1189,4 +1237,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, channelForProcess, controlFileFor, deliverToWorker, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
