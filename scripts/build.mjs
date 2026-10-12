@@ -94,15 +94,12 @@ const result = await esbuild.build({
 	metafile: true,
 	// Provide a CJS `require` for any bundled dependency that still uses it
 	// (e.g. ajv's codegen emits `require("...")` strings). ESM-only otherwise.
-	// Pi loads bundled ESM through jiti, but the Workers extension forwards its
-	// own filename to child Pi processes. Define a bundle-local fallback before
-	// the extension source so its `__filename` reference works in that ESM
-	// context without mutating global state. Keep this sentinel stable: child
-	// loading is routed through the installed package, rather than treating the
-	// bundle path as a native CJS filename.
+	// Pi loads bundled ESM through jiti; extension sources use `import.meta.url`
+	// (not `__filename`, which is undefined in this ESM context) when they need
+	// their own installed path — e.g. Workers passing its bundle to child Pi
+	// processes and radare2 locating its Seatbelt profile next to the bundle.
 	banner: {
 		js: [
-			"const __filename = 'nope';",
 			"import { createRequire as __createRequire } from 'node:module';",
 			"const require = __createRequire(import.meta.url);",
 		].join(""),

@@ -1,4 +1,4 @@
-const __filename = 'nope';import { createRequire as __createRequire } from 'node:module';const require = __createRequire(import.meta.url);
+import { createRequire as __createRequire } from 'node:module';const require = __createRequire(import.meta.url);
 
 // extensions/file-guard/index.ts
 import {

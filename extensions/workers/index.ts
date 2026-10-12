@@ -10,6 +10,7 @@ import { appendFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/pro
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -256,10 +257,12 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 	return /^(node|bun)(\.exe)?$/.test(executable) ? { command: "pi", args } : { command: process.execPath, args };
 }
 
-function safeEventData(value: unknown): unknown {
+type SafeEventData = string | number | boolean | null | unknown[] | { [key: string]: unknown };
+
+function safeEventData(value: unknown): SafeEventData {
 	try {
 		const text = JSON.stringify(value);
-		if (text.length <= MAX_EVENT_BYTES) return JSON.parse(text);
+		if (text.length <= MAX_EVENT_BYTES) return JSON.parse(text) as SafeEventData;
 		return { truncated: true, preview: text.slice(0, MAX_EVENT_BYTES), originalBytes: Buffer.byteLength(text) };
 	} catch (error) {
 		return { unserializable: true, preview: String(value), error: error instanceof Error ? error.message : String(error) };
@@ -447,7 +450,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 	const processGlobals = globalThis as Record<PropertyKey, unknown>;
 	if (processGlobals[EXTENSION_INSTANCE_SYMBOL]) return;
 	processGlobals[EXTENSION_INSTANCE_SYMBOL] = true;
-	const extensionPath = process.env.PI_WORKERS_EXTENSION_PATH ?? __filename;
+	const extensionPath = process.env.PI_WORKERS_EXTENSION_PATH ?? fileURLToPath(import.meta.url);
 	const runtimeDir = process.env.PI_WORKERS_RUNTIME_DIR || runtimeDirForRoot();
 	const ownWorkerId = process.env.PI_WORKERS_WORKER_ID;
 	const lockedConfig = configFromEnvironment();
