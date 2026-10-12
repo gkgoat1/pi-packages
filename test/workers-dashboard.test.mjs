@@ -10,6 +10,9 @@ const { buildDashboardView } = await import("../extensions/workers/src/dashboard
 const { WorkersDashboardComponent } = await import("../extensions/workers/src/dashboard-component.ts");
 const { createRefreshDriver } = await import("../extensions/workers/src/dashboard-refresh.ts");
 
+const workersModule = await import("../extensions/workers/index.ts");
+const { parseAnswerText, runDashboardAction } = workersModule;
+
 function record(id, parentId, overrides = {}) {
 	const now = new Date().toISOString();
 	return {
@@ -301,4 +304,60 @@ test("concurrent ticks coalesce into one derivation", async () => {
 	} finally {
 		driver.stop();
 	}
+});
+
+test("parseAnswerText maps cancel/yes/no/text to dialog response shapes", () => {
+	assert.deepEqual(parseAnswerText("cancel"), { cancelled: true });
+	assert.deepEqual(parseAnswerText("yes"), { confirmed: true });
+	assert.deepEqual(parseAnswerText("no"), { confirmed: false });
+	assert.deepEqual(parseAnswerText("Allow"), { value: "Allow" });
+	assert.deepEqual(parseAnswerText("a longer answer"), { value: "a longer answer" });
+});
+
+test("dashboard in a non-tui mode falls back to a text listing", async () => {
+	await withRuntime(async (runtimeDir) => {
+		const now = new Date().toISOString();
+		await workersModule.writeRecord(runtimeDir, {
+			id: "d1", parentId: null, depth: 1, model: "fake/worker", tag: "research",
+			callerModel: "fake/caller", lineageRoutes: ["fake/caller#research"],
+			status: "idle", createdAt: now, updatedAt: now,
+		});
+		const notifications = [];
+		let opened = 0;
+		await runDashboardAction({
+			runtimeDir,
+			getConfig: async () => ({ maxDepth: 2, maxWorkers: 4, models: {} }),
+			extensionPath: "/tmp/ext.js",
+			openDashboard: async () => { opened += 1; },
+		}, { mode: "rpc", cwd: root, ui: { notify: (text) => notifications.push(text) } });
+		assert.equal(opened, 0, "no custom UI outside TUI mode");
+		assert.equal(notifications.length, 1);
+		assert.match(notifications[0], /d1/);
+	});
+});
+
+test("dashboard in tui mode opens the custom screen", async () => {
+	await withRuntime(async (runtimeDir) => {
+		let opened = 0;
+		await runDashboardAction({
+			runtimeDir,
+			getConfig: async () => ({ maxDepth: 2, maxWorkers: 4, models: {} }),
+			extensionPath: "/tmp/ext.js",
+			openDashboard: async () => { opened += 1; },
+		}, { mode: "tui", cwd: root, ui: { notify: () => {} } });
+		assert.equal(opened, 1);
+	});
+});
+
+test("dashboard with no workers notifies the empty state", async () => {
+	await withRuntime(async (runtimeDir) => {
+		const notifications = [];
+		await runDashboardAction({
+			runtimeDir,
+			getConfig: async () => ({ maxDepth: 2, maxWorkers: 4, models: {} }),
+			extensionPath: "/tmp/ext.js",
+			openDashboard: async () => {},
+		}, { mode: "rpc", cwd: root, ui: { notify: (text) => notifications.push(text) } });
+		assert.match(notifications[0] ?? "", /no workers/i);
+	});
 });

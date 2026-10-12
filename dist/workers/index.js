@@ -4420,6 +4420,289 @@ __export(typebox_exports, {
   With: () => With2
 });
 
+// extensions/workers/src/dashboard-model.ts
+var MAX_PREVIEW_CHARS = 160;
+function preview(text) {
+  if (!text) return void 0;
+  const single = text.replace(/\s+/g, " ").trim();
+  return single.length > MAX_PREVIEW_CHARS ? `${single.slice(0, MAX_PREVIEW_CHARS)}\u2026` : single;
+}
+function compareCreated(a, b) {
+  return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+}
+function buildDashboardView(input) {
+  if (input.records.length === 0) {
+    return { rows: [], selectedIndex: 0, totalPendingDialogs: 0, emptyText: "No workers in this runtime." };
+  }
+  const childrenByParent = /* @__PURE__ */ new Map();
+  for (const record of input.records) {
+    const siblings = childrenByParent.get(record.parentId) ?? [];
+    siblings.push(record);
+    childrenByParent.set(record.parentId, siblings);
+  }
+  for (const siblings of childrenByParent.values()) siblings.sort(compareCreated);
+  const known = new Set(input.records.map((record) => record.id));
+  const roots = (childrenByParent.get(null) ?? []).slice();
+  for (const [parentId, siblings] of childrenByParent) {
+    if (parentId !== null && !known.has(parentId)) roots.push(...siblings);
+  }
+  roots.sort(compareCreated);
+  const rows = [];
+  const visit = (record, indent) => {
+    rows.push({
+      id: record.id,
+      parentId: record.parentId,
+      indent,
+      status: record.status,
+      model: record.model,
+      tag: record.tag,
+      attempts: record.attempts ?? 1,
+      pendingDialogs: input.pendingByWorker[record.id]?.length ?? 0,
+      errorPreview: preview(record.error),
+      outputPreview: preview(record.lastOutput?.slice(-500))
+    });
+    for (const child of childrenByParent.get(record.id) ?? []) visit(child, indent + 1);
+  };
+  for (const root of roots) visit(root, 0);
+  const totalPendingDialogs = Object.values(input.pendingByWorker).reduce((sum, list) => sum + list.length, 0);
+  const selectedIndex = Math.min(Math.max(input.previousSelection ?? 0, 0), rows.length - 1);
+  return { rows, selectedIndex, totalPendingDialogs };
+}
+
+// extensions/workers/src/dashboard-component.ts
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+var MIN_WIDTH = 20;
+var ID_WIDTH = 10;
+var STATUS_WIDTH = 9;
+function statusBadge(row) {
+  return row.pendingDialogs > 0 ? ` \u2B24${row.pendingDialogs}` : "";
+}
+var WorkersDashboardComponent = class {
+  constructor(deps) {
+    this.deps = deps;
+  }
+  deps;
+  selection = 0;
+  statusLine = "";
+  mode = { kind: "browse" };
+  inFlight;
+  view() {
+    const view = this.deps.getView();
+    this.selection = Math.min(Math.max(this.selection, 0), Math.max(view.rows.length - 1, 0));
+    return { view, rows: view.rows };
+  }
+  line(text, width) {
+    return truncateToWidth(text, Math.max(width, MIN_WIDTH), "\u2026", true);
+  }
+  render(width) {
+    const { view, rows } = this.view();
+    const lines = [];
+    const pending = view.totalPendingDialogs > 0 ? `  \u2B24 ${view.totalPendingDialogs} pending dialog${view.totalPendingDialogs === 1 ? "" : "s"}` : "";
+    lines.push(this.line(` Workers (${rows.length})${pending}`, width));
+    lines.push(this.line("", width));
+    if (view.emptyText) {
+      lines.push(this.line(` ${view.emptyText}`, width));
+    } else {
+      for (const [index, row] of rows.entries()) {
+        const marker = index === this.selection ? "\u25B6" : " ";
+        const indent = "  ".repeat(Math.min(row.indent, 8));
+        const id = row.id.padEnd(ID_WIDTH).slice(0, ID_WIDTH);
+        const status = row.status.padEnd(STATUS_WIDTH).slice(0, STATUS_WIDTH);
+        lines.push(this.line(`${marker}${indent}${id}${status}${row.tag} \xD7${row.attempts}${statusBadge(row)}`, width));
+        if (index === this.selection) {
+          if (row.errorPreview) lines.push(this.line(`   error: ${row.errorPreview}`, width));
+          else if (row.outputPreview) lines.push(this.line(`   out: ${row.outputPreview}`, width));
+        }
+      }
+    }
+    lines.push(this.line("", width));
+    if (this.mode.kind === "input") {
+      lines.push(this.line(` ${this.mode.label}: ${this.mode.buffer}\u258F`, width));
+    } else if (this.mode.kind === "confirm") {
+      lines.push(this.line(` ${this.mode.label} (y/n)`, width));
+    } else if (this.statusLine) {
+      lines.push(this.line(` ${this.statusLine}`, width));
+    }
+    lines.push(this.line(" [\u2191/k \u2193/j] move  [r]eply [s]teer [u]resume [a]nswer [x]abort  [q/Esc] close", width));
+    return lines;
+  }
+  /** Stateless rendering from the model each frame; nothing to invalidate. */
+  invalidate() {
+  }
+  handleInput(data) {
+    if (this.mode.kind === "input") return this.handleInputMode(data);
+    if (this.mode.kind === "confirm") return this.handleConfirmMode(data);
+    return this.handleBrowseMode(data);
+  }
+  handleBrowseMode(data) {
+    if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
+      this.deps.onClose();
+      return;
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+      this.selection = Math.max(this.selection - 1, 0);
+      return;
+    }
+    if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+      this.selection = Math.min(this.selection + 1, Math.max(this.deps.getView().rows.length - 1, 0));
+      return;
+    }
+    if (matchesKey(data, "r")) return this.startInput("reply");
+    if (matchesKey(data, "s")) return this.startInput("steer");
+    if (matchesKey(data, "a")) return this.startAnswer();
+    if (matchesKey(data, "x")) return this.startAbort();
+    if (matchesKey(data, "u")) return this.dispatchResume();
+  }
+  handleInputMode(data) {
+    if (this.mode.kind !== "input") return;
+    if (matchesKey(data, Key.escape)) {
+      this.mode = { kind: "browse" };
+      this.statusLine = "Cancelled.";
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      const mode = this.mode;
+      this.mode = { kind: "browse" };
+      this.submitInput(mode);
+      return;
+    }
+    if (matchesKey(data, Key.backspace)) {
+      this.mode.buffer = this.mode.buffer.slice(0, -1);
+      return;
+    }
+    if (visibleWidth(data) > 0) this.mode.buffer += data;
+  }
+  handleConfirmMode(data) {
+    if (this.mode.kind !== "confirm") return;
+    if (matchesKey(data, "y")) {
+      const workerId = this.selectedWorkerId();
+      this.mode = { kind: "browse" };
+      if (workerId) this.dispatch(`Abort ${workerId}`, () => this.requireAction("abort")(workerId));
+      return;
+    }
+    if (matchesKey(data, "n") || matchesKey(data, Key.escape)) {
+      this.mode = { kind: "browse" };
+      this.statusLine = "Abort cancelled.";
+    }
+  }
+  requireAction(name) {
+    const action = this.deps.actions[name];
+    if (!action) throw new Error(`The ${name} action is unavailable here.`);
+    return action;
+  }
+  startInput(action) {
+    const workerId = this.selectedWorkerId();
+    if (!workerId) {
+      this.statusLine = "No workers to act on.";
+      return;
+    }
+    try {
+      this.requireAction(action);
+    } catch (error) {
+      this.statusLine = error instanceof Error ? error.message : String(error);
+      return;
+    }
+    this.mode = { kind: "input", action, buffer: "", label: `${action === "reply" ? "Reply to" : "Steer"} ${workerId}` };
+  }
+  startAnswer() {
+    const workerId = this.selectedWorkerId();
+    if (!workerId) {
+      this.statusLine = "No workers to act on.";
+      return;
+    }
+    const pending = this.deps.getPending?.(workerId) ?? [];
+    if (pending.length === 0) {
+      this.statusLine = `No pending dialog on ${workerId}.`;
+      return;
+    }
+    const first = pending[0];
+    this.mode = { kind: "input", action: "answer", buffer: "", label: `Answer ${first.method} on ${workerId} (${first.requestId})`, requestId: first.requestId };
+  }
+  startAbort() {
+    const workerId = this.selectedWorkerId();
+    if (!workerId) {
+      this.statusLine = "No workers to act on.";
+      return;
+    }
+    this.mode = { kind: "confirm", action: "abort", label: `Abort ${workerId}?` };
+  }
+  dispatchResume() {
+    const workerId = this.selectedWorkerId();
+    if (!workerId) {
+      this.statusLine = "No workers to act on.";
+      return;
+    }
+    this.dispatch(`Resume ${workerId}`, () => this.requireAction("resume")(workerId));
+  }
+  submitInput(mode) {
+    const workerId = this.selectedWorkerId();
+    const message = mode.buffer.trim();
+    if (!workerId || !message) {
+      this.statusLine = message ? "No workers to act on." : "Nothing to send.";
+      return;
+    }
+    if (mode.action === "answer") {
+      const requestId = mode.requestId;
+      if (!requestId) {
+        this.statusLine = "No pending dialog to answer.";
+        return;
+      }
+      this.dispatch(`Answer ${requestId}`, () => this.requireAction("answer")(workerId, requestId, message));
+      return;
+    }
+    const actionName = mode.action;
+    this.dispatch(`${actionName} ${workerId}`, () => this.requireAction(actionName)(workerId, message));
+  }
+  dispatch(label, run) {
+    this.statusLine = `${label}\u2026`;
+    this.inFlight = (async () => {
+      try {
+        this.statusLine = await run();
+      } catch (error) {
+        this.statusLine = error instanceof Error ? error.message : String(error);
+      }
+    })();
+  }
+  /** Test hook: wait for the in-flight action to settle. */
+  async flush() {
+    await this.inFlight;
+  }
+  /** Surface an action outcome on the dashboard's status line. */
+  setStatus(text) {
+    this.statusLine = text;
+  }
+  selectedWorkerId() {
+    return this.deps.getView().rows[this.selection]?.id;
+  }
+};
+
+// extensions/workers/src/dashboard-refresh.ts
+function createRefreshDriver(deps) {
+  let stopped = false;
+  let ticking = false;
+  async function tick() {
+    if (stopped || ticking) return;
+    ticking = true;
+    try {
+      deps.apply(await deps.derive());
+    } catch (error) {
+      deps.onError(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      ticking = false;
+    }
+  }
+  const timer = setInterval(() => void tick(), deps.intervalMs);
+  timer.unref?.();
+  return {
+    tick,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    }
+  };
+}
+
 // extensions/workers/index.ts
 var CONFIG_FILE = "workers.json";
 var WORKER_DIR_PREFIX = "pi-workers-";
@@ -4675,6 +4958,19 @@ async function pendingDialogsFromEvents(runtimeDir) {
   }
   return pending;
 }
+function groupPending(pending) {
+  const grouped = {};
+  for (const entry of pending) (grouped[entry.workerId] ??= []).push(entry);
+  return grouped;
+}
+async function runDashboardAction(deps, ctx) {
+  if (ctx.mode !== "tui") {
+    const records = await listRecords(deps.runtimeDir);
+    ctx.ui.notify(records.length ? records.map(summarize).join("\n\n") : "No workers in this runtime.", "info");
+    return;
+  }
+  await deps.openDashboard(ctx);
+}
 async function registerPendingDialog(runtimeDir, workerId, payload, proc) {
   const requestId = typeof payload.id === "string" ? payload.id : void 0;
   const method = typeof payload.method === "string" ? payload.method : "unknown";
@@ -4736,6 +5032,12 @@ async function cancelPendingDialogs(runtimeDir, workerId, reason) {
       reason
     });
   }
+}
+function parseAnswerText(text) {
+  if (text === "cancel") return { cancelled: true };
+  if (text === "yes") return { confirmed: true };
+  if (text === "no") return { confirmed: false };
+  return { value: text };
 }
 function uiResponseForMethod(method, response) {
   if ("cancelled" in response && response.cancelled === true) return { cancelled: true };
@@ -5523,8 +5825,57 @@ ${transcript}`).join("\n\n---\n\n"), { workers });
       return textResult(outcome.detail, { workerId: params.workerId, outcome });
     }
   });
+  const openDashboard = async (ctx) => {
+    let currentPending = {};
+    let currentView = buildDashboardView({ records: await listRecords(runtimeDir), pendingByWorker: currentPending });
+    await ctx.ui.custom(async (tui, _theme, _keybindings, done) => {
+      const component = new WorkersDashboardComponent({
+        getView: () => currentView,
+        getPending: (workerId) => currentPending[workerId] ?? [],
+        onClose: () => {
+          driver.stop();
+          done(void 0);
+        },
+        actions: {
+          reply: async (workerId, message) => {
+            const config = await getConfig(ctx.cwd);
+            return (await deliverToWorker(runtimeDir, workerId, message, "reply", { cwd: ctx.cwd, config, extensionPath, ownWorkerId })).detail;
+          },
+          steer: async (workerId, message) => {
+            const config = await getConfig(ctx.cwd);
+            return (await deliverToWorker(runtimeDir, workerId, message, "steer", { cwd: ctx.cwd, config, extensionPath, ownWorkerId })).detail;
+          },
+          resume: async (workerId) => {
+            const config = await getConfig(ctx.cwd);
+            const resumed = await resumeWorker(runtimeDir, workerId, { cwd: ctx.cwd, config, extensionPath });
+            return `Resumed ${workerId} (attempt ${resumed.record.attempts ?? "?"}).`;
+          },
+          abort: async (workerId) => {
+            await abortWorker(runtimeDir, workerId);
+            return `Abort requested for ${workerId}.`;
+          },
+          answer: async (workerId, requestId, text) => {
+            const config = await getConfig(ctx.cwd);
+            return (await deliverUiAnswer(runtimeDir, workerId, requestId, parseAnswerText(text), { cwd: ctx.cwd, config, extensionPath, ownWorkerId })).detail;
+          }
+        }
+      });
+      const driver = createRefreshDriver({
+        intervalMs: 500,
+        derive: async () => ({ records: await listRecords(runtimeDir), pending: await pendingDialogsFromEvents(runtimeDir) }),
+        apply: ({ records, pending }) => {
+          currentPending = groupPending(pending);
+          currentView = buildDashboardView({ records, pendingByWorker: currentPending });
+          tui.requestRender();
+        },
+        onError: (error) => component.setStatus(`Refresh error: ${error.message}`)
+      });
+      void driver.tick();
+      return component;
+    });
+  };
   pi.registerCommand("workers", {
-    description: "Manage workers: status, query, listen, spawn, reply, steer, resume, ui, answer, abort",
+    description: "Manage workers: status, query, listen, spawn, reply, steer, resume, dashboard, ui, answer, abort",
     handler: async (args, ctx) => {
       const [action = "status", first, ...rest] = args.trim().split(/\s+/);
       if (action === "status") {
@@ -5550,6 +5901,10 @@ ${await transcriptSummary(record, 20)}`, "info");
 nextCursor: ${nextCursor}`, "info");
         return;
       }
+      if (action === "dashboard") {
+        await runDashboardAction({ runtimeDir, getConfig, extensionPath, ownWorkerId, openDashboard }, ctx);
+        return;
+      }
       if (action === "ui") {
         const pending = await pendingDialogsFromEvents(runtimeDir);
         ctx.ui.notify(
@@ -5562,8 +5917,7 @@ nextCursor: ${nextCursor}`, "info");
       if (action === "answer") {
         const [requestId, ...answer] = rest;
         if (!first || !requestId || answer.length === 0) throw new Error("Usage: /workers answer <worker-id> <request-id> <cancel|yes|no|text>");
-        const text = answer.join(" ");
-        const response = text === "cancel" ? { cancelled: true } : text === "yes" ? { confirmed: true } : text === "no" ? { confirmed: false } : { value: text };
+        const response = parseAnswerText(answer.join(" "));
         const config = await getConfig(ctx.cwd);
         const outcome = await deliverUiAnswer(runtimeDir, first, requestId, response, { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
         if (outcome.kind === "rejected") throw new Error(outcome.detail);
@@ -5602,7 +5956,7 @@ nextCursor: ${nextCursor}`, "info");
 ${summarize(worker)}` : "Worker launch failed before a status record was available.", "info");
         return;
       }
-      throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | ui | answer <id> <request-id> <cancel|yes|no|text> | abort <id>");
+      throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | dashboard | ui | answer <id> <request-id> <cancel|yes|no|text> | abort <id>");
     }
   });
 }
@@ -5620,6 +5974,7 @@ export {
   deliverUiAnswer,
   formatWorkerEvents,
   offsetFileFor,
+  parseAnswerText,
   pendingDialogsFor,
   pendingDialogsFromEvents,
   readAppliedControls,
@@ -5629,6 +5984,7 @@ export {
   registerPendingDialog,
   resolvePendingDialog,
   resumeWorker,
+  runDashboardAction,
   sessionFileFor,
   startWorkerProcess,
   stopWorkerProcesses,

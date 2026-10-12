@@ -12,9 +12,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { CONFIG_DIR_NAME, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { buildDashboardView } from "./src/dashboard-model.ts";
+import { WorkersDashboardComponent } from "./src/dashboard-component.ts";
+import { createRefreshDriver } from "./src/dashboard-refresh.ts";
 
 const CONFIG_FILE = "workers.json";
 const WORKER_DIR_PREFIX = "pi-workers-";
@@ -398,6 +401,30 @@ async function pendingDialogsFromEvents(runtimeDir: string): Promise<PendingUiFr
 	return pending;
 }
 
+function groupPending(pending: PendingUiFromEvents[]): Record<string, PendingUiFromEvents[]> {
+	const grouped: Record<string, PendingUiFromEvents[]> = {};
+	for (const entry of pending) (grouped[entry.workerId] ??= []).push(entry);
+	return grouped;
+}
+
+interface DashboardCommandDeps {
+	runtimeDir: string;
+	getConfig: (cwd: string) => Promise<WorkersConfig>;
+	extensionPath: string;
+	ownWorkerId?: string;
+	openDashboard: (ctx: ExtensionCommandContext) => Promise<void>;
+}
+
+/** `/workers dashboard`: TUI opens the screen; other modes get a text listing. */
+async function runDashboardAction(deps: DashboardCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
+	if (ctx.mode !== "tui") {
+		const records = await listRecords(deps.runtimeDir);
+		ctx.ui.notify(records.length ? records.map(summarize).join("\n\n") : "No workers in this runtime.", "info");
+		return;
+	}
+	await deps.openDashboard(ctx);
+}
+
 /**
  * Register a dialog request as pending. Overflows auto-cancel back to the
  * child immediately so it never hangs on a dialog nobody can answer, and a
@@ -467,6 +494,14 @@ async function cancelPendingDialogs(runtimeDir: string, workerId: string, reason
 }
 
 type UiDialogResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
+
+/** Map dashboard/command answer text to a dialog response shape. */
+function parseAnswerText(text: string): UiDialogResponse {
+	if (text === "cancel") return { cancelled: true };
+	if (text === "yes") return { confirmed: true };
+	if (text === "no") return { confirmed: false };
+	return { value: text };
+}
 
 /** Shape-check an answer against the dialog method per the RPC extension UI contract. */
 function uiResponseForMethod(method: string, response: UiDialogResponse): Record<string, unknown> | undefined {
@@ -1402,8 +1437,58 @@ export default function workersExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	const openDashboard = async (ctx: ExtensionCommandContext): Promise<void> => {
+		let currentPending: Record<string, PendingUiFromEvents[]> = {};
+		let currentView = buildDashboardView({ records: await listRecords(runtimeDir), pendingByWorker: currentPending });
+		await ctx.ui.custom(async (tui, _theme, _keybindings, done) => {
+			const component = new WorkersDashboardComponent({
+				getView: () => currentView,
+				getPending: (workerId) => currentPending[workerId] ?? [],
+				onClose: () => {
+					driver.stop();
+					done(undefined);
+				},
+				actions: {
+					reply: async (workerId, message) => {
+						const config = await getConfig(ctx.cwd);
+						return (await deliverToWorker(runtimeDir, workerId, message, "reply", { cwd: ctx.cwd, config, extensionPath, ownWorkerId })).detail;
+					},
+					steer: async (workerId, message) => {
+						const config = await getConfig(ctx.cwd);
+						return (await deliverToWorker(runtimeDir, workerId, message, "steer", { cwd: ctx.cwd, config, extensionPath, ownWorkerId })).detail;
+					},
+					resume: async (workerId) => {
+						const config = await getConfig(ctx.cwd);
+						const resumed = await resumeWorker(runtimeDir, workerId, { cwd: ctx.cwd, config, extensionPath });
+						return `Resumed ${workerId} (attempt ${resumed.record.attempts ?? "?"}).`;
+					},
+					abort: async (workerId) => {
+						await abortWorker(runtimeDir, workerId);
+						return `Abort requested for ${workerId}.`;
+					},
+					answer: async (workerId, requestId, text) => {
+						const config = await getConfig(ctx.cwd);
+						return (await deliverUiAnswer(runtimeDir, workerId, requestId, parseAnswerText(text), { cwd: ctx.cwd, config, extensionPath, ownWorkerId })).detail;
+					},
+				},
+			});
+			const driver = createRefreshDriver({
+				intervalMs: 500,
+				derive: async () => ({ records: await listRecords(runtimeDir), pending: await pendingDialogsFromEvents(runtimeDir) }),
+				apply: ({ records, pending }) => {
+					currentPending = groupPending(pending);
+					currentView = buildDashboardView({ records, pendingByWorker: currentPending });
+					tui.requestRender();
+				},
+				onError: (error) => component.setStatus(`Refresh error: ${error.message}`),
+			});
+			void driver.tick();
+			return component;
+		});
+	};
+
 	pi.registerCommand("workers", {
-		description: "Manage workers: status, query, listen, spawn, reply, steer, resume, ui, answer, abort",
+		description: "Manage workers: status, query, listen, spawn, reply, steer, resume, dashboard, ui, answer, abort",
 		handler: async (args, ctx) => {
 			const [action = "status", first, ...rest] = args.trim().split(/\s+/);
 			if (action === "status") {
@@ -1425,6 +1510,10 @@ export default function workersExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`${events.map((event) => `[${event.seq}] ${event.kind}:${event.type} ${JSON.stringify(event.data)}`).join("\n") || "No events."}\nnextCursor: ${nextCursor}`, "info");
 				return;
 			}
+			if (action === "dashboard") {
+				await runDashboardAction({ runtimeDir, getConfig, extensionPath, ownWorkerId, openDashboard }, ctx);
+				return;
+			}
 			if (action === "ui") {
 				const pending = await pendingDialogsFromEvents(runtimeDir);
 				ctx.ui.notify(
@@ -1438,11 +1527,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 			if (action === "answer") {
 				const [requestId, ...answer] = rest;
 				if (!first || !requestId || answer.length === 0) throw new Error("Usage: /workers answer <worker-id> <request-id> <cancel|yes|no|text>");
-				const text = answer.join(" ");
-				const response = text === "cancel" ? { cancelled: true as const }
-					: text === "yes" ? { confirmed: true as const }
-					: text === "no" ? { confirmed: false as const }
-					: { value: text };
+				const response = parseAnswerText(answer.join(" "));
 				const config = await getConfig(ctx.cwd);
 				const outcome = await deliverUiAnswer(runtimeDir, first, requestId, response, { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
 				if (outcome.kind === "rejected") throw new Error(outcome.detail);
@@ -1480,7 +1565,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(worker ? `Worker started.\n${summarize(worker)}` : "Worker launch failed before a status record was available.", "info");
 				return;
 			}
-			throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | ui | answer <id> <request-id> <cancel|yes|no|text> | abort <id>");
+			throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | dashboard | ui | answer <id> <request-id> <cancel|yes|no|text> | abort <id>");
 		},
 	});
 }
@@ -1488,4 +1573,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, formatWorkerEvents, offsetFileFor, pendingDialogsFor, pendingDialogsFromEvents, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, formatWorkerEvents, offsetFileFor, parseAnswerText, pendingDialogsFor, pendingDialogsFromEvents, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, runDashboardAction, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };

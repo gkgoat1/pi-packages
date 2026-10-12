@@ -88,6 +88,7 @@ Extensions running inside a worker use Pi's supported RPC UI methods, and the pa
 
 - `/workers ui` lists pending dialogs across the tree (worker, method, request id, title).
 - `/workers answer <worker-id> <request-id> <text>` answers a select/input/editor dialog; `yes`/`no` answers a confirm; `cancel` dismisses any dialog.
+- `/workers dashboard` opens a live TUI screen: the worker tree with status, model, attempts, and pending-dialog badges; arrows (or j/k) select; `r` reply, `s` steer, `u` resume, `a` answer, `x` abort (with confirmation), `q`/Esc close. Outside TUI mode it falls back to the text status listing.
 - Dialog state is derived from the event stream (`ui_request` − `ui_answered`), so nested workers work the same way; answers relay through the process that owns the child.
 - Pending dialogs cancel automatically when a worker exits or the runtime shuts down, and late answers are rejected.
 
