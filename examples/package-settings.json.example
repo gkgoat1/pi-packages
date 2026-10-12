@@ -15,7 +15,6 @@ Replace `/path/to/pi-packages` with the installed package directory. For npm and
 Choose one of these exact paths:
 
 - `dist/file-guard/index.js`
-- `dist/mcp-client/index.js`
 - `dist/workers/index.js`
 - `dist/thinking-compression/index.js`
 - `dist/gondolin/index.js` (requires this package's `node_modules` for the external `@earendil-works/gondolin` dependency)
@@ -28,7 +27,6 @@ The `dist/` bundles are self-contained: their non-Pi dependencies are inlined, s
 {
   "extensions": [
     "/path/to/pi-packages/dist/file-guard",
-    "/path/to/pi-packages/dist/mcp-client",
     "/path/to/pi-packages/dist/workers",
     "/path/to/pi-packages/dist/thinking-compression",
     "/path/to/pi-packages/dist/gondolin"
@@ -36,4 +34,4 @@ The `dist/` bundles are self-contained: their non-Pi dependencies are inlined, s
 }
 ```
 
-The extension-specific runtime opt-ins must also be configured: enable File Guard in its config/environment, set `enabled: true` in `.pi/workers.json`, set `enabled: true` in MCP Client configuration, and set `enabled: true` in Gondolin Sandbox configuration (see [`gondolin.json.example`](gondolin.json.example)).
+The extension-specific runtime opt-ins must also be configured: enable File Guard in its config/environment, set `enabled: true` in `.pi/workers.json`, and set `enabled: true` in Gondolin Sandbox configuration (see [`gondolin.json.example`](gondolin.json.example)). MCP servers are Pi's built-in `mcp.json` concern (see [`mcp.json.example`](mcp.json.example)), not a bundled extension.

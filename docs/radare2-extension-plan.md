@@ -206,8 +206,8 @@ agent can invoke any of it. So the process tree is confined **from the start**, 
 ### 5.3 Gondolin VM — optional backend (`src/sandbox/gondolin.ts`)
 
 Executes the r2 process inside the repo's [Gondolin](../gondolin) micro-VM (QEMU) via its
-`execGuest` shared API — the same integration path the mcp-client extension uses for in-VM
-MCP servers. Gondolin runs with `accel: "tcg"` (software emulation) by default, so it works
+`execGuest` shared API — the same integration path File Guard uses for VM-filesystem
+interception. Gondolin runs with `accel: "tcg"` (software emulation) by default, so it works
 on both Linux and macOS without requiring hardware virtualization.
 
 - **Opt-in on both platforms**, off by default: for heavy RE workloads the host (especially
@@ -241,7 +241,7 @@ on both Linux and macOS without requiring hardware virtualization.
 
 ## 6. Configuration
 
-Layered, disabled-unless-detected, mirroring `extensions/mcp-client`:
+Layered, disabled-unless-detected, mirroring `extensions/file-guard`:
 
 1. `~/.pi/agent/radare2.json`
 2. `.pi/radare2.json` (trusted projects only — gate reads on `ctx.isProjectTrusted()`)
@@ -326,7 +326,7 @@ graph/zignatures/write/patching), JSON-command column (`aflj` vs `afl~{}`), and 
   backend missing → error. There is no configuration that runs r2 unconfined.
 - Binaries are attacker-controlled input twice over: content in tool results (prompt-injection
   surface) and parsing bugs in r2 itself. The sandbox is the mitigation for the latter;
-  README states the former plainly, mirroring the mcp-client warning block.
+  README states the former plainly, mirroring the file-guard warning block.
 - Trust model per backend differs and must be stated: Seatbelt/bwrap confine the host user
   context (secret reads denied, writes allowlisted); Gondolin relocates r2 into a VM where
   only mounted host paths exist — secrets are unreachable, but a credential-stub HTTP proxy

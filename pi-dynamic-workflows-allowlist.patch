@@ -7,7 +7,7 @@ index 7080e7e..20cd335 100644
  Two behavior changes to know about:
  
 -- **Subagents no longer load host extensions by default.** Each run now builds one shared, extension-free resource loader for all of its subagents (a memory-leak mitigation). Skills, prompts, and `AGENTS.md` context still load, and the coding tools and any toolset (e.g. `web-research`) you hand a subagent are unaffected. What subagents lose is **host-extension-registered tools** — MCP bridges, browser tools, or anything else another installed extension adds. If an `agentType` names one of those tools in its allowlist, that entry now matches nothing. This also means a subagent can no longer recurse into another orchestration extension, even one not covered by the existing tool denylist.
-+- **Host extensions are disabled by default, but you can allowlist them.** Each run still shares one resource loader; configure `enabledSubagentExtensions` in `~/.pi/workflows/settings.json` with package names (for example `pi-blackhole` or `neuralyzer`) or package-relative extension directories (for example `mcp-client`) to re-enable only those host extensions. The workflow's own `workflow` and `workflow_control` tools remain denied to subagents.
++- **Host extensions are disabled by default, but you can allowlist them.** Each run still shares one resource loader; configure `enabledSubagentExtensions` in `~/.pi/workflows/settings.json` with package names (for example `pi-blackhole` or `neuralyzer`) or package-relative extension directories (for example `file-guard`) to re-enable only those host extensions. The workflow's own `workflow` and `workflow_control` tools remain denied to subagents.
  - **Checkpoints persisted before this release re-run once.** `checkpoint()`'s resume-identity hash now also covers `default`, `headless`, and `timeoutMs`, so changing any of them between runs correctly invalidates a stale cached answer. This is a one-time effect: any checkpoint cached under the old hash simply re-prompts once and then caches normally again.
  
  ## Development
@@ -190,7 +190,7 @@ index 71809ad..af8c064 100644
 +   * Extension identifiers that workflow subagents may load. Omitted or empty
 +   * keeps host extensions disabled (the safe default). Identifiers match a
 +   * package source/name (for example `pi-blackhole` or `neuralyzer`) or a
-+   * package-relative extension directory (for example `mcp-client`).
++   * package-relative extension directory (for example `file-guard`).
 +   */
 +  enabledSubagentExtensions?: string[];
    /**
@@ -254,7 +254,7 @@ index 51354d8..64e9445 100644
 +});
 +
 +test("the subagent extension allowlist matches package sources and package-relative directories", () => {
-+  const allowlist = ["neuralyzer", "pi-dynamic-workflows", "dist", "mcp-client", "pi-blackhole"];
++  const allowlist = ["neuralyzer", "pi-dynamic-workflows", "dist", "file-guard", "pi-blackhole"];
 +  const extension = (path: string, source: string, baseDir: string) => ({ path, sourceInfo: { source, baseDir } });
 +  assert.ok(
 +    matchesEnabledExtension(
@@ -273,7 +273,7 @@ index 51354d8..64e9445 100644
 +    ),
 +  );
 +  assert.ok(matchesEnabledExtension(extension("/local/dist/index.ts", "local", "/local"), allowlist));
-+  assert.ok(matchesEnabledExtension(extension("/local/mcp-client/index.ts", "local", "/local"), allowlist));
++  assert.ok(matchesEnabledExtension(extension("/local/file-guard/index.ts", "local", "/local"), allowlist));
 +  assert.ok(
 +    matchesEnabledExtension(
 +      extension("/npm/pi-blackhole/dist/index.js", "npm:pi-blackhole", "/npm/pi-blackhole"),
@@ -308,10 +308,10 @@ index a0bc0a1..4026eb1 100644
 +    try {
 +      writeFileSync(
 +        settingsPath,
-+        JSON.stringify({ enabledSubagentExtensions: ["neuralyzer", 42, "", "  ", "mcp-client"] }),
++        JSON.stringify({ enabledSubagentExtensions: ["neuralyzer", 42, "", "  ", "file-guard"] }),
 +        "utf-8",
 +      );
-+      assert.deepEqual(loadWorkflowSettings(settingsPath), { enabledSubagentExtensions: ["neuralyzer", "mcp-client"] });
++      assert.deepEqual(loadWorkflowSettings(settingsPath), { enabledSubagentExtensions: ["neuralyzer", "file-guard"] });
 +    } finally {
 +      rmSync(settingsPath, { force: true });
 +    }

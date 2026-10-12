@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pdf-reader": {
+      "command": "npx",
+      "args": ["--yes", "@sylphx/pdf-reader-mcp@3.0.14"],
+      "enabled": true,
+      "exposure": "direct",
+      "description": "Read and search PDF documents; verify consequential claims visually before citing."
+    }
+  }
+}
