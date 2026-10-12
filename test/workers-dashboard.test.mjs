@@ -96,6 +96,7 @@ function dashboard(rows, options = {}) {
 	let closed = false;
 	const component = new WorkersDashboardComponent({
 		getView: () => buildDashboardView({ records: rows, pendingByWorker: options.pendingByWorker ?? {}, previousSelection: options.selection }),
+		getPending: options.getPending ?? (() => []),
 		onClose: () => { closed = true; },
 		actions: options.actions ?? {},
 	});
@@ -146,4 +147,86 @@ test("an empty tree renders the empty state and closes on q", () => {
 	assert.match(lines.join("\n"), /no workers/i);
 	component.handleInput("q");
 	assert.equal(wasClosed(), true);
+});
+
+async function type(component, text) {
+	for (const char of text) component.handleInput(char);
+}
+
+test("reply on the selected worker calls the reply action and shows its outcome", async () => {
+	const calls = [];
+	const { component } = dashboard([record("a1", null, { status: "idle" })], {
+		actions: { reply: async (workerId, message) => { calls.push([workerId, message]); return `sent: ${message}`; } },
+	});
+	component.handleInput("r");
+	await type(component, "keep going");
+	component.handleInput("\r");
+	await component.flush();
+	assert.deepEqual(calls, [["a1", "keep going"]]);
+	assert.match(component.render(80).join("\n"), /sent: keep going/);
+});
+
+test("a rejected steer lands on the status line", async () => {
+	const { component } = dashboard([record("e1", null, { status: "error", error: "boom" })], {
+		actions: { steer: async () => { throw new Error("Worker e1 is error; nothing to steer. Use workers_reply to resume it."); } },
+	});
+	component.handleInput("s");
+	await type(component, "redirect");
+	component.handleInput("\r");
+	await component.flush();
+	assert.match(component.render(80).join("\n"), /nothing to steer/);
+});
+
+test("abort asks for confirmation and declines cleanly", async () => {
+	let aborts = 0;
+	const { component } = dashboard([record("a1", null)], {
+		actions: { abort: async () => { aborts += 1; return "aborted"; } },
+	});
+	component.handleInput("x");
+	assert.match(component.render(80).join("\n"), /abort/i);
+	component.handleInput("n");
+	await component.flush();
+	assert.equal(aborts, 0);
+	component.handleInput("x");
+	component.handleInput("y");
+	await component.flush();
+	assert.equal(aborts, 1);
+});
+
+test("answer on a worker with a pending dialog sends the request id", async () => {
+	const calls = [];
+	const { component } = dashboard([record("d1", null)], {
+		pendingByWorker: { d1: [{ workerId: "d1", requestId: "r1", method: "select", title: "Pick" }] },
+		getPending: (workerId) => (workerId === "d1" ? [{ workerId: "d1", requestId: "r1", method: "select", title: "Pick" }] : []),
+		actions: { answer: async (workerId, requestId, answer) => { calls.push([workerId, requestId, answer]); return "answered"; } },
+	});
+	component.handleInput("a");
+	await type(component, "Allow");
+	component.handleInput("\r");
+	await component.flush();
+	assert.deepEqual(calls, [["d1", "r1", "Allow"]]);
+});
+
+test("answer without a pending dialog is a no-op with a status note", async () => {
+	const { component } = dashboard([record("d2", null)], { actions: {} });
+	component.handleInput("a");
+	await component.flush();
+	assert.match(component.render(80).join("\n"), /no pending dialog/i);
+});
+
+test("actions on an empty dashboard are no-ops with a status note", async () => {
+	const { component } = dashboard([]);
+	component.handleInput("r");
+	await component.flush();
+	assert.match(component.render(80).join("\n"), /no workers/i);
+});
+
+test("escape in an input mode cancels back to browsing, not the dashboard", async () => {
+	const { component, wasClosed } = dashboard([record("a1", null)], { actions: { reply: async () => "ok" } });
+	component.handleInput("r");
+	await type(component, "draft");
+	component.handleInput("\x1b");
+	assert.equal(wasClosed(), false, "escape cancels the input, keeps the screen");
+	component.handleInput("\x1b");
+	assert.equal(wasClosed(), true, "second escape closes");
 });

@@ -2,10 +2,14 @@
  * The workers dashboard screen: a keyboard-driven Pi TUI component over the
  * pure view model. Rendering is width-safe (every line is truncated to the
  * supplied width) and theme-neutral so tests can assert on plain text.
+ *
+ * Actions route through injected async callbacks (the shared Phase 2/3
+ * validators); the component only manages browse/input/confirm modes and
+ * surfaces outcomes on its status line.
  */
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
-import type { DashboardRow, DashboardView } from "./dashboard-model.ts";
+import type { DashboardPendingLike, DashboardRow, DashboardView } from "./dashboard-model.ts";
 
 export interface DashboardActions {
 	reply?(workerId: string, message: string): Promise<string>;
@@ -17,9 +21,15 @@ export interface DashboardActions {
 
 export interface DashboardComponentDeps {
 	getView: () => DashboardView;
+	getPending?: (workerId: string) => DashboardPendingLike[];
 	onClose: () => void;
 	actions: DashboardActions;
 }
+
+type DashboardMode =
+	| { kind: "browse" }
+	| { kind: "input"; action: "reply" | "steer" | "answer"; buffer: string; label: string; requestId?: string }
+	| { kind: "confirm"; action: "abort"; label: string };
 
 const MIN_WIDTH = 20;
 const ID_WIDTH = 10;
@@ -32,6 +42,8 @@ function statusBadge(row: DashboardRow): string {
 export class WorkersDashboardComponent implements Component {
 	private selection = 0;
 	private statusLine = "";
+	private mode: DashboardMode = { kind: "browse" };
+	private inFlight: Promise<void> | undefined;
 
 	constructor(private readonly deps: DashboardComponentDeps) {}
 
@@ -69,7 +81,13 @@ export class WorkersDashboardComponent implements Component {
 		}
 
 		lines.push(this.line("", width));
-		if (this.statusLine) lines.push(this.line(` ${this.statusLine}`, width));
+		if (this.mode.kind === "input") {
+			lines.push(this.line(` ${this.mode.label}: ${this.mode.buffer}▏`, width));
+		} else if (this.mode.kind === "confirm") {
+			lines.push(this.line(` ${this.mode.label} (y/n)`, width));
+		} else if (this.statusLine) {
+			lines.push(this.line(` ${this.statusLine}`, width));
+		}
 		lines.push(this.line(" [↑/k ↓/j] move  [r]eply [s]teer [u]resume [a]nswer [x]abort  [q/Esc] close", width));
 		return lines;
 	}
@@ -78,6 +96,12 @@ export class WorkersDashboardComponent implements Component {
 	invalidate(): void {}
 
 	handleInput(data: string): void {
+		if (this.mode.kind === "input") return this.handleInputMode(data);
+		if (this.mode.kind === "confirm") return this.handleConfirmMode(data);
+		return this.handleBrowseMode(data);
+	}
+
+	private handleBrowseMode(data: string): void {
 		if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
 			this.deps.onClose();
 			return;
@@ -90,6 +114,135 @@ export class WorkersDashboardComponent implements Component {
 			this.selection = Math.min(this.selection + 1, Math.max(this.deps.getView().rows.length - 1, 0));
 			return;
 		}
+		if (matchesKey(data, "r")) return this.startInput("reply");
+		if (matchesKey(data, "s")) return this.startInput("steer");
+		if (matchesKey(data, "a")) return this.startAnswer();
+		if (matchesKey(data, "x")) return this.startAbort();
+		if (matchesKey(data, "u")) return this.dispatchResume();
+	}
+
+	private handleInputMode(data: string): void {
+		if (this.mode.kind !== "input") return;
+		if (matchesKey(data, Key.escape)) {
+			this.mode = { kind: "browse" };
+			this.statusLine = "Cancelled.";
+			return;
+		}
+		if (matchesKey(data, Key.enter)) {
+			const mode = this.mode;
+			this.mode = { kind: "browse" };
+			this.submitInput(mode);
+			return;
+		}
+		if (matchesKey(data, Key.backspace)) {
+			this.mode.buffer = this.mode.buffer.slice(0, -1);
+			return;
+		}
+		if (visibleWidth(data) > 0) this.mode.buffer += data;
+	}
+
+	private handleConfirmMode(data: string): void {
+		if (this.mode.kind !== "confirm") return;
+		if (matchesKey(data, "y")) {
+			const workerId = this.selectedWorkerId();
+			this.mode = { kind: "browse" };
+			if (workerId) this.dispatch(`Abort ${workerId}`, () => this.requireAction("abort")(workerId));
+			return;
+		}
+		if (matchesKey(data, "n") || matchesKey(data, Key.escape)) {
+			this.mode = { kind: "browse" };
+			this.statusLine = "Abort cancelled.";
+		}
+	}
+
+	private requireAction<K extends keyof DashboardActions>(name: K): NonNullable<DashboardActions[K]> {
+		const action = this.deps.actions[name];
+		if (!action) throw new Error(`The ${name} action is unavailable here.`);
+		return action as NonNullable<DashboardActions[K]>;
+	}
+
+	private startInput(action: "reply" | "steer"): void {
+		const workerId = this.selectedWorkerId();
+		if (!workerId) {
+			this.statusLine = "No workers to act on.";
+			return;
+		}
+		try {
+			this.requireAction(action);
+		} catch (error) {
+			this.statusLine = error instanceof Error ? error.message : String(error);
+			return;
+		}
+		this.mode = { kind: "input", action, buffer: "", label: `${action === "reply" ? "Reply to" : "Steer"} ${workerId}` };
+	}
+
+	private startAnswer(): void {
+		const workerId = this.selectedWorkerId();
+		if (!workerId) {
+			this.statusLine = "No workers to act on.";
+			return;
+		}
+		const pending = this.deps.getPending?.(workerId) ?? [];
+		if (pending.length === 0) {
+			this.statusLine = `No pending dialog on ${workerId}.`;
+			return;
+		}
+		const first = pending[0]!;
+		this.mode = { kind: "input", action: "answer", buffer: "", label: `Answer ${first.method} on ${workerId} (${first.requestId})`, requestId: first.requestId };
+	}
+
+	private startAbort(): void {
+		const workerId = this.selectedWorkerId();
+		if (!workerId) {
+			this.statusLine = "No workers to act on.";
+			return;
+		}
+		this.mode = { kind: "confirm", action: "abort", label: `Abort ${workerId}?` };
+	}
+
+	private dispatchResume(): void {
+		const workerId = this.selectedWorkerId();
+		if (!workerId) {
+			this.statusLine = "No workers to act on.";
+			return;
+		}
+		this.dispatch(`Resume ${workerId}`, () => this.requireAction("resume")(workerId));
+	}
+
+	private submitInput(mode: Extract<DashboardMode, { kind: "input" }>): void {
+		const workerId = this.selectedWorkerId();
+		const message = mode.buffer.trim();
+		if (!workerId || !message) {
+			this.statusLine = message ? "No workers to act on." : "Nothing to send.";
+			return;
+		}
+		if (mode.action === "answer") {
+			const requestId = mode.requestId;
+			if (!requestId) {
+				this.statusLine = "No pending dialog to answer.";
+				return;
+			}
+			this.dispatch(`Answer ${requestId}`, () => this.requireAction("answer")(workerId, requestId, message));
+			return;
+		}
+		const actionName: "reply" | "steer" = mode.action;
+		this.dispatch(`${actionName} ${workerId}`, () => this.requireAction(actionName)(workerId, message));
+	}
+
+	private dispatch(label: string, run: () => Promise<string>): void {
+		this.statusLine = `${label}…`;
+		this.inFlight = (async () => {
+			try {
+				this.statusLine = await run();
+			} catch (error) {
+				this.statusLine = error instanceof Error ? error.message : String(error);
+			}
+		})();
+	}
+
+	/** Test hook: wait for the in-flight action to settle. */
+	async flush(): Promise<void> {
+		await this.inFlight;
 	}
 
 	/** Surface an action outcome on the dashboard's status line. */
