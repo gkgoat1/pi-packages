@@ -8,6 +8,7 @@ const root = resolve(import.meta.dirname, "..");
 
 const { buildDashboardView } = await import("../extensions/workers/src/dashboard-model.ts");
 const { WorkersDashboardComponent } = await import("../extensions/workers/src/dashboard-component.ts");
+const { createRefreshDriver } = await import("../extensions/workers/src/dashboard-refresh.ts");
 
 function record(id, parentId, overrides = {}) {
 	const now = new Date().toISOString();
@@ -229,4 +230,75 @@ test("escape in an input mode cancels back to browsing, not the dashboard", asyn
 	assert.equal(wasClosed(), false, "escape cancels the input, keeps the screen");
 	component.handleInput("\x1b");
 	assert.equal(wasClosed(), true, "second escape closes");
+});
+
+test("a refresh tick applies newly derived data", async () => {
+	let status = "running";
+	const applied = [];
+	const driver = createRefreshDriver({
+		derive: async () => [record("a1", null, { status })],
+		apply: (records) => applied.push(records),
+		onError: () => {},
+		intervalMs: 60_000,
+	});
+	try {
+		await driver.tick();
+		status = "idle";
+		await driver.tick();
+		assert.equal(applied.length, 2);
+		assert.equal(applied[1]?.[0]?.status, "idle", "the second tick sees the transition");
+	} finally {
+		driver.stop();
+	}
+});
+
+test("a stopped driver never ticks again", async () => {
+	let ticks = 0;
+	const driver = createRefreshDriver({ derive: async () => [], apply: () => { ticks += 1; }, onError: () => {}, intervalMs: 60_000 });
+	await driver.tick();
+	driver.stop();
+	await driver.tick();
+	assert.equal(ticks, 1);
+});
+
+test("a throwing apply is contained and the next tick recovers", async () => {
+	let fail = true;
+	const errors = [];
+	const applied = [];
+	const driver = createRefreshDriver({
+		derive: async () => [1],
+		apply: (data) => { if (fail) throw new Error("render boom"); applied.push(data); },
+		onError: (error) => errors.push(error.message),
+		intervalMs: 60_000,
+	});
+	try {
+		await driver.tick();
+		fail = false;
+		await driver.tick();
+		assert.deepEqual(errors, ["render boom"]);
+		assert.equal(applied.length, 1, "recovered on the next tick");
+	} finally {
+		driver.stop();
+	}
+});
+
+test("concurrent ticks coalesce into one derivation", async () => {
+	let deriveCalls = 0;
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const driver = createRefreshDriver({
+		derive: async () => { deriveCalls += 1; await gate; return []; },
+		apply: () => {},
+		onError: () => {},
+		intervalMs: 60_000,
+	});
+	try {
+		const first = driver.tick();
+		const second = driver.tick();
+		release();
+		await Promise.all([first, second]);
+		assert.equal(deriveCalls, 1, "the second tick was skipped while the first ran");
+	} finally {
+		driver.stop();
+	}
 });
