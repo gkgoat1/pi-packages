@@ -139,6 +139,14 @@ function textResult(text: string, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text }], details };
 }
 
+/** Render one page of worker events the way workers_listen and the dashboard consume them. */
+function formatWorkerEvents(events: WorkerEvent[], nextCursor: number): string {
+	const body = events.length
+		? events.map((event) => `[${event.seq}] ${event.timestamp} ${event.kind}:${event.type}\n${JSON.stringify(event.data)}`).join("\n\n")
+		: "No events after that cursor.";
+	return `${body}\n\nnextCursor: ${nextCursor}`;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1334,8 +1342,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 		async execute(_id, params) {
 			if (!(await readRecord(runtimeDir, params.workerId))) throw new Error(`Unknown worker: ${params.workerId}`);
 			const result = await readWorkerEvents(runtimeDir, params.workerId, params.since ?? 0, params.limit ?? 25);
-			const body = result.events.length ? result.events.map((event) => `[${event.seq}] ${event.timestamp} ${event.kind}:${event.type}\n${JSON.stringify(event.data)}`).join("\n\n") : "No events after that cursor.";
-			return textResult(`${body}\n\nnextCursor: ${result.nextCursor}`, result);
+			return textResult(formatWorkerEvents(result.events, result.nextCursor), result);
 		},
 	});
 
@@ -1426,4 +1433,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, offsetFileFor, pendingDialogsFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, formatWorkerEvents, offsetFileFor, pendingDialogsFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };

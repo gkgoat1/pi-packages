@@ -4459,6 +4459,13 @@ var ReplyParams = typebox_exports.Object({
 function textResult(text, details = {}) {
   return { content: [{ type: "text", text }], details };
 }
+function formatWorkerEvents(events, nextCursor) {
+  const body = events.length ? events.map((event) => `[${event.seq}] ${event.timestamp} ${event.kind}:${event.type}
+${JSON.stringify(event.data)}`).join("\n\n") : "No events after that cursor.";
+  return `${body}
+
+nextCursor: ${nextCursor}`;
+}
 function isObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -5466,11 +5473,7 @@ ${transcript}`).join("\n\n---\n\n"), { workers });
     async execute(_id, params) {
       if (!await readRecord(runtimeDir, params.workerId)) throw new Error(`Unknown worker: ${params.workerId}`);
       const result = await readWorkerEvents(runtimeDir, params.workerId, params.since ?? 0, params.limit ?? 25);
-      const body = result.events.length ? result.events.map((event) => `[${event.seq}] ${event.timestamp} ${event.kind}:${event.type}
-${JSON.stringify(event.data)}`).join("\n\n") : "No events after that cursor.";
-      return textResult(`${body}
-
-nextCursor: ${result.nextCursor}`, result);
+      return textResult(formatWorkerEvents(result.events, result.nextCursor), result);
     }
   });
   pi.registerTool({
@@ -5573,6 +5576,7 @@ export {
   workersExtension as default,
   deliverToWorker,
   deliverUiAnswer,
+  formatWorkerEvents,
   offsetFileFor,
   pendingDialogsFor,
   readAppliedControls,

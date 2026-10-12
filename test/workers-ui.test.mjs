@@ -7,7 +7,7 @@ import test from "node:test";
 const root = resolve(import.meta.dirname, "..");
 const fixturePath = join(root, "fixtures", "fake-rpc-worker.mjs");
 
-const { classifyUiRequest, pendingDialogsFor, readWorkerEvents, registerPendingDialog, resolvePendingDialog, sessionFileFor, startWorkerProcess, stopWorkerProcesses, writeRecord } = await import("../extensions/workers/index.ts");
+const { classifyUiRequest, formatWorkerEvents, pendingDialogsFor, readWorkerEvents, registerPendingDialog, resolvePendingDialog, sessionFileFor, startWorkerProcess, stopWorkerProcesses, writeRecord } = await import("../extensions/workers/index.ts");
 
 const config = { maxDepth: 2, maxWorkers: 4, models: {} };
 
@@ -164,6 +164,41 @@ test("the 65th pending dialog on one worker is auto-cancelled, not stored", asyn
 			return events.some((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.id === "dlg-64" && event.data?.outcome === "cancelled");
 		});
 	});
+});
+
+test("a cursor walk over mixed events yields every ui record exactly once", async () => {
+	await withWorker("ui00010", "emit-ui-fire-and-forget", async ({ runtimeDir, workerId }) => {
+		await waitFor(async () => {
+			const { events } = await readWorkerEvents(runtimeDir, workerId);
+			return events.some((event) => event.type === "agent_settled");
+		});
+		const seen = [];
+		let cursor = 0;
+		for (;;) {
+			const page = await readWorkerEvents(runtimeDir, workerId, cursor, 2);
+			if (page.events.length === 0) break;
+			seen.push(...page.events);
+			cursor = page.nextCursor;
+		}
+		const seqs = seen.map((event) => event.seq);
+		assert.deepEqual([...seqs].sort((a, b) => a - b), seqs, "events arrive in sequence order");
+		assert.equal(new Set(seqs).size, seqs.length, "no duplicates across pages");
+		const uiSeqs = seen.filter((event) => event.kind === "ui").map((event) => event.seq);
+		assert.equal(uiSeqs.length, 5, "all five ui records appear in the walk");
+	});
+});
+
+test("formatWorkerEvents renders ui records with method and request id", () => {
+	const rendered = formatWorkerEvents([
+		{ seq: 1, timestamp: "2026-10-12T00:00:00Z", workerId: "w1", kind: "ui", type: "ui_request", data: { id: "req-9", method: "select", title: "Pick" } },
+		{ seq: 2, timestamp: "2026-10-12T00:00:01Z", workerId: "w1", kind: "ui", type: "ui_answered", data: { id: "req-9", method: "select", outcome: "answered" } },
+	], 2);
+	assert.match(rendered, /ui:ui_request/);
+	assert.match(rendered, /req-9/);
+	assert.match(rendered, /select/);
+	assert.match(rendered, /ui:ui_answered/);
+	assert.match(rendered, /nextCursor: 2/);
+	assert.equal(formatWorkerEvents([], 3).includes("No events"), true);
 });
 
 test("a duplicate request id replaces the older entry with a note", async () => {
