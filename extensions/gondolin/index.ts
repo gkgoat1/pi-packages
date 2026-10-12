@@ -24,8 +24,10 @@
  * (`Symbol.for("pi-packages.gondolin.shared")`, see src/shared.ts) so the
  * other extensions in this package can reuse it without depending on this
  * bundle: File Guard enforces its policy as VM-filesystem interception, and
- * the MCP client launches servers inside the VM. Both integrations activate
- * only when this extension and the consumer are enabled.
+ * radare2 runs analysis inside the VM. Both integrations activate only when
+ * this extension and the consumer are enabled. The older in-VM MCP server
+ * path was retired with the bundled mcp-client extension; see
+ * docs/mcp-migration.md.
  */
 
 import path from "node:path";

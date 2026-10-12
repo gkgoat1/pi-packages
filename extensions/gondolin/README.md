@@ -143,7 +143,9 @@ interface GondolinShared {
   stdio. The guest env is the minimal base plus credential stubs; env values
   matching discovered secrets are stubbed so real keys stay host-side (the
   HTTP proxy inflates them back on egress). This is how the
-  [MCP client](../mcp-client) runs servers in-VM.
+  [radare2](../radare2) extension runs binary analysis in-VM. The older
+  in-VM MCP server path was retired with the bundled mcp-client extension
+  (see `docs/mcp-migration.md`).
 - **`refreshTrust`** re-reads this extension's config with the session's
   project-trust decision, so earlier-loaded extensions see the correct
   enabled state.
@@ -155,7 +157,7 @@ extension are enabled.
 
 - Gondolin's proxy blocks internal IP ranges by default (`blockInternalRanges`); direct SSH egress and DNS modes are available in gondolin itself but not configured here.
 - The extension requires `/bin/bash` and honors the same guest image as upstream pi-gondolin.
-- Scope is the four overridden tools plus user `!` commands; MCP servers or subprocesses Pi spawns otherwise still run on the host.
+- Scope is the four overridden tools plus user `!` commands; MCP servers (Pi's built-in `mcp.json`) or subprocesses Pi spawns otherwise still run on the host.
 
 ## Attribution
 
