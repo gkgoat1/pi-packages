@@ -168,3 +168,66 @@ test("a wrong response shape is rejected before any write", async () => {
 		assert.equal((await pendingDialogsFor(runtimeDir, "ans007")).length, 1, "still pending");
 	});
 });
+
+test("a child exit cancels its pending dialogs exactly once", async () => {
+	await withRuntime(async (runtimeDir) => {
+		const proc = await startDialogChild(runtimeDir, "can001");
+		const pending = (await pendingDialogsFor(runtimeDir, "can001"))[0];
+		proc.stdin.write(`${JSON.stringify({ type: "fixture_crash", id: "boom" })}\n`);
+		await once(proc, "exit");
+		await waitFor(async () => (await pendingDialogsFor(runtimeDir, "can001")).length === 0);
+		await waitFor(async () => {
+			const { events } = await readWorkerEvents(runtimeDir, "can001");
+			return events.some((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.id === pending.requestId && event.data?.outcome === "cancelled");
+		});
+		const { cancelPendingDialogs } = await import("../extensions/workers/index.ts");
+		await cancelPendingDialogs(runtimeDir, "can001", "duplicate cleanup");
+		const { events } = await readWorkerEvents(runtimeDir, "can001");
+		const cancellations = events.filter((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.id === pending.requestId && event.data?.outcome === "cancelled");
+		assert.equal(cancellations.length, 1, "cancellation is idempotent");
+	});
+});
+
+test("stopping all worker processes cancels pending dialogs across workers", async () => {
+	await withRuntime(async (runtimeDir) => {
+		await startDialogChild(runtimeDir, "can002");
+		await startDialogChild(runtimeDir, "can003");
+		assert.equal((await pendingDialogsFor(runtimeDir, "can002")).length, 1);
+		assert.equal((await pendingDialogsFor(runtimeDir, "can003")).length, 1);
+		await stopWorkerProcesses();
+		await waitFor(async () => (await pendingDialogsFor(runtimeDir, "can002")).length === 0 && (await pendingDialogsFor(runtimeDir, "can003")).length === 0);
+		for (const id of ["can002", "can003"]) {
+			await waitFor(async () => {
+				const { events } = await readWorkerEvents(runtimeDir, id);
+				return events.some((event) => event.type === "ui_answered" && event.data?.outcome === "cancelled");
+			});
+		}
+	});
+});
+
+test("answering after cancellation is rejected", async () => {
+	await withRuntime(async (runtimeDir) => {
+		const proc = await startDialogChild(runtimeDir, "can004");
+		const pending = (await pendingDialogsFor(runtimeDir, "can004"))[0];
+		proc.stdin.write(`${JSON.stringify({ type: "fixture_crash", id: "boom" })}\n`);
+		await once(proc, "exit");
+		await waitFor(async () => (await pendingDialogsFor(runtimeDir, "can004")).length === 0);
+		const outcome = await deliverUiAnswer(runtimeDir, "can004", pending.requestId, { value: "late" }, { cwd: root, config, extensionPath: fixturePath });
+		assert.equal(outcome.kind, "rejected");
+		// Either the stale-id rejection (event flushed) or the dead-process rejection.
+		assert.match(outcome.detail, /No pending dialog|not running/);
+	});
+});
+
+test("a resumed worker starts with an empty pending set", async () => {
+	await withRuntime(async (runtimeDir) => {
+		const proc = await startDialogChild(runtimeDir, "can005");
+		proc.stdin.write(`${JSON.stringify({ type: "fixture_crash", id: "boom" })}\n`);
+		await once(proc, "exit");
+		await waitFor(async () => (await pendingDialogsFor(runtimeDir, "can005")).length === 0);
+		const { resumeWorker } = await import("../extensions/workers/index.ts");
+		const resumed = await resumeWorker(runtimeDir, "can005", { cwd: root, config, extensionPath: fixturePath });
+		assert.equal(resumed.outcome, "resumed");
+		assert.equal((await pendingDialogsFor(runtimeDir, "can005")).length, 0, "no stale dialogs follow the resume");
+	});
+});

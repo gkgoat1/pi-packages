@@ -412,6 +412,21 @@ async function resolvePendingDialog(runtimeDir: string, workerId: string, reques
 	return true;
 }
 
+/** Cancel every pending dialog for one worker; idempotent (an empty store emits nothing). */
+async function cancelPendingDialogs(runtimeDir: string, workerId: string, reason: string): Promise<void> {
+	const store = pendingDialogs.get(pendingKey(runtimeDir, workerId));
+	if (!store || store.size === 0) return;
+	for (const entry of [...store.values()]) {
+		store.delete(entry.requestId);
+		await appendWorkerEvent(runtimeDir, workerId, "ui", "ui_answered", {
+			id: entry.requestId,
+			method: entry.method,
+			outcome: "cancelled",
+			reason,
+		});
+	}
+}
+
 type UiDialogResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
 /** Shape-check an answer against the dialog method per the RPC extension UI contract. */
@@ -424,7 +439,7 @@ function uiResponseForMethod(method: string, response: UiDialogResponse): Record
 
 /** Derive dialog state from the shared event stream (works for nested workers too). */
 async function dialogPendingInEvents(runtimeDir: string, workerId: string, requestId: string): Promise<{ method: string } | undefined> {
-	const { events } = await readWorkerEvents(runtimeDir, workerId, 0, 100);
+	const { events } = await readWorkerEvents(runtimeDir, workerId, 0, 10_000);
 	let method: string | undefined;
 	for (const event of events) {
 		if (event.kind !== "ui") continue;
@@ -700,7 +715,7 @@ function terminalStatus(record: WorkerRecord): boolean {
 	return ["error", "aborted", "exited"].includes(record.status);
 }
 
-/** Kill every worker process this process owns; used by session shutdown and test cleanup. */
+/** Kill every worker process this process owns and cancel its pending dialogs. */
 async function stopWorkerProcesses(): Promise<void> {
 	const live = [...ownedProcesses.values()];
 	for (const proc of live) {
@@ -711,6 +726,10 @@ async function stopWorkerProcesses(): Promise<void> {
 			? new Promise((resolve) => proc.once("exit", resolve))
 			: undefined
 	)));
+	for (const key of [...pendingDialogs.keys()]) {
+		const [runtimeDir, workerId] = key.split("\u0000");
+		if (runtimeDir && workerId) await cancelPendingDialogs(runtimeDir, workerId, "runtime shutdown");
+	}
 }
 
 /**
@@ -897,7 +916,10 @@ async function resumeWorker(runtimeDir: string, workerId: string, options: Resum
 	}
 	const record = await readRecord(runtimeDir, workerId);
 	if (!record) throw new Error(`Unknown worker: ${workerId}`);
-	if (record.status === "starting" || record.status === "running") {
+	// No live owned process reaches this point. "running" without one is
+	// ambiguous (stale record); "starting" without one is a dead-on-launch
+	// attempt and safe to retry — the initial-task gate decides what is sent.
+	if (record.status === "running") {
 		throw new Error(`Worker ${workerId} is ${record.status}; steer or reply through the live channel instead of resuming.`);
 	}
 	const resume = (async (): Promise<ResumeResult> => {
@@ -952,6 +974,8 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 	channelByProcess.set(proc, channel);
 	const key = ownedKey(runtimeDir, record.id);
 	ownedProcesses.set(key, proc);
+	// A new attempt owns no unanswered dialogs from a previous attempt.
+	pendingDialogs.delete(pendingKey(runtimeDir, record.id));
 	proc.on("exit", () => {
 		if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
 	});
@@ -1006,6 +1030,7 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 	});
 	proc.on("exit", (code, signal) => {
 		channel.failAll(`Worker process exited (${signal ?? code ?? "unknown"}); outstanding commands were not answered.`);
+		void cancelPendingDialogs(runtimeDir, record.id, `process exited (${signal ?? code ?? "unknown"})`);
 		void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_exit", { code, signal, stderr: stderr.slice(-4000) });
 		void (async () => {
 			await mutateRecord(runtimeDir, record.id, (current) => {
@@ -1401,4 +1426,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, offsetFileFor, pendingDialogsFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, offsetFileFor, pendingDialogsFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };

@@ -4695,6 +4695,19 @@ async function resolvePendingDialog(runtimeDir, workerId, requestId, outcome, de
   });
   return true;
 }
+async function cancelPendingDialogs(runtimeDir, workerId, reason) {
+  const store = pendingDialogs.get(pendingKey(runtimeDir, workerId));
+  if (!store || store.size === 0) return;
+  for (const entry of [...store.values()]) {
+    store.delete(entry.requestId);
+    await appendWorkerEvent(runtimeDir, workerId, "ui", "ui_answered", {
+      id: entry.requestId,
+      method: entry.method,
+      outcome: "cancelled",
+      reason
+    });
+  }
+}
 function uiResponseForMethod(method, response) {
   if ("cancelled" in response && response.cancelled === true) return { cancelled: true };
   if (method === "confirm") return "confirmed" in response && typeof response.confirmed === "boolean" ? { confirmed: response.confirmed } : void 0;
@@ -4702,7 +4715,7 @@ function uiResponseForMethod(method, response) {
   return void 0;
 }
 async function dialogPendingInEvents(runtimeDir, workerId, requestId) {
-  const { events } = await readWorkerEvents(runtimeDir, workerId, 0, 100);
+  const { events } = await readWorkerEvents(runtimeDir, workerId, 0, 1e4);
   let method;
   for (const event of events) {
     if (event.kind !== "ui") continue;
@@ -4926,6 +4939,10 @@ async function stopWorkerProcesses() {
     if (processIsLive(proc)) proc.kill("SIGTERM");
   }
   await Promise.all(live.map((proc) => proc.exitCode === null && proc.signalCode === null ? new Promise((resolve) => proc.once("exit", resolve)) : void 0));
+  for (const key of [...pendingDialogs.keys()]) {
+    const [runtimeDir, workerId] = key.split("\0");
+    if (runtimeDir && workerId) await cancelPendingDialogs(runtimeDir, workerId, "runtime shutdown");
+  }
 }
 async function deliverToWorker(runtimeDir, workerId, message, mode, deps) {
   if (message.length > MAX_OUTPUT_CHARS) return { kind: "rejected", detail: `Message exceeds ${MAX_OUTPUT_CHARS} characters.` };
@@ -5052,7 +5069,7 @@ async function resumeWorker(runtimeDir, workerId, options) {
   }
   const record = await readRecord(runtimeDir, workerId);
   if (!record) throw new Error(`Unknown worker: ${workerId}`);
-  if (record.status === "starting" || record.status === "running") {
+  if (record.status === "running") {
     throw new Error(`Worker ${workerId} is ${record.status}; steer or reply through the live channel instead of resuming.`);
   }
   const resume = (async () => {
@@ -5097,6 +5114,7 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
   channelByProcess.set(proc, channel);
   const key = ownedKey(runtimeDir, record.id);
   ownedProcesses.set(key, proc);
+  pendingDialogs.delete(pendingKey(runtimeDir, record.id));
   proc.on("exit", () => {
     if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
   });
@@ -5149,6 +5167,7 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
   });
   proc.on("exit", (code, signal) => {
     channel.failAll(`Worker process exited (${signal ?? code ?? "unknown"}); outstanding commands were not answered.`);
+    void cancelPendingDialogs(runtimeDir, record.id, `process exited (${signal ?? code ?? "unknown"})`);
     void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_exit", { code, signal, stderr: stderr.slice(-4e3) });
     void (async () => {
       await mutateRecord(runtimeDir, record.id, (current) => {
@@ -5547,6 +5566,7 @@ export {
   acknowledgeControl,
   appendControl,
   applyForwardControl,
+  cancelPendingDialogs,
   channelForProcess,
   classifyUiRequest,
   controlFileFor,
