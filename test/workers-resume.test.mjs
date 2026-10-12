@@ -130,16 +130,15 @@ test("a resume with an unpersisted initial task sends the task instead of the re
 	});
 });
 
-test("resuming a live worker is rejected without touching the process", async () => {
+test("a live owned worker takes the message without a new attempt", async () => {
 	await withRuntime(async (runtimeDir) => {
 		const record = makeRecord(runtimeDir, "res005");
 		await writeRecord(runtimeDir, record);
 		const proc = registerChild(startWorkerProcess(root, runtimeDir, config, record, "task", fixturePath));
 		await waitFor(async () => (await readRecord(runtimeDir, "res005"))?.initialTaskPersisted === true);
-		await assert.rejects(
-			() => resumeWorker(runtimeDir, "res005", { cwd: root, config, extensionPath: fixturePath, message: "x", liveProcess: proc }),
-			/live|running/i,
-		);
+		const result = await resumeWorker(runtimeDir, "res005", { cwd: root, config, extensionPath: fixturePath, message: "x" });
+		assert.equal(result.outcome, "sent", "delivery into the live process, not a restart");
+		assert.equal(result.process, proc);
 		assert.equal(proc.exitCode, null, "the live process is untouched");
 	});
 });
