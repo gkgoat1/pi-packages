@@ -4785,13 +4785,50 @@ var channelByProcess = /* @__PURE__ */ new WeakMap();
 function channelForProcess(proc) {
   return channelByProcess.get(proc);
 }
+async function applyForwardControl(runtimeDir, ownerId, control, deps) {
+  const target = typeof control.targetWorkerId === "string" ? control.targetWorkerId : void 0;
+  const inner = control.inner;
+  const fail = async (detail2) => {
+    await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: "rejected", detail: detail2 });
+    return { kind: "rejected", detail: detail2 };
+  };
+  if (!target) return fail("forward control is missing targetWorkerId");
+  if (!inner || !["steer", "follow_up", "prompt", "abort"].includes(inner.type)) return fail(`forward to ${target}: unsupported inner control type`);
+  if (inner.message !== void 0 && inner.message.length > MAX_OUTPUT_CHARS) return fail(`forward to ${target}: message exceeds ${MAX_OUTPUT_CHARS} characters`);
+  const record = await readRecord(runtimeDir, target);
+  if (!record || record.parentId !== ownerId) return fail(`forward target ${target} is not a child of ${ownerId}`);
+  const proc = ownedProcesses.get(ownedKey(runtimeDir, target));
+  if (processIsLive(proc)) {
+    const channel = channelForProcess(proc);
+    if (!channel) return fail(`forward target ${target} has no RPC channel`);
+    try {
+      const command = inner.type === "abort" ? { type: "abort" } : { type: inner.type, message: inner.message ?? "" };
+      const response = await channel.send(command);
+      const disposition = isObject(response.data) && typeof response.data.disposition === "string" ? response.data.disposition : void 0;
+      const detail2 = response.success === true ? `${inner.type} delivered to ${target}${disposition ? ` (${disposition})` : ""}` : `${inner.type} rejected by ${target}: ${String(response.error ?? "unknown")}`;
+      await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: response.success === true ? "applied" : "rejected", detail: detail2 });
+      return { kind: response.success === true ? "applied" : "rejected", detail: detail2 };
+    } catch (error) {
+      return fail(`forward to ${target} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (inner.type === "abort") return fail(`forward target ${target} is not running; nothing to abort`);
+  const resumed = await resumeWorker(runtimeDir, target, { cwd: deps.cwd, config: deps.config, extensionPath: deps.extensionPath, message: inner.message });
+  deps.trackProcess?.(resumed.process);
+  const detail = `resumed ${target} (attempt ${resumed.record.attempts ?? "?"}) and delivered ${inner.type}`;
+  await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: "applied", detail });
+  return { kind: "applied", detail };
+}
 var ownedProcesses = /* @__PURE__ */ new Map();
 var resumesInFlight = /* @__PURE__ */ new Map();
 function processIsLive(proc) {
   return Boolean(proc && proc.exitCode === null && proc.signalCode === null);
 }
+function ownedKey(runtimeDir, workerId) {
+  return `${runtimeDir}\0${workerId}`;
+}
 async function resumeWorker(runtimeDir, workerId, options) {
-  const key = `${runtimeDir}\0${workerId}`;
+  const key = ownedKey(runtimeDir, workerId);
   const owned = ownedProcesses.get(key);
   if (processIsLive(owned) || processIsLive(options.liveProcess)) {
     const proc = processIsLive(owned) ? owned : options.liveProcess;
@@ -4823,13 +4860,9 @@ async function resumeWorker(runtimeDir, workerId, options) {
     await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "worker_resumed", { attempt: attempts, message: options.message ? true : false });
     const task = record.initialTaskPersisted ? void 0 : record.initialTask;
     const proc = startWorkerProcess(options.cwd, runtimeDir, options.config, updated ?? record, task, options.extensionPath);
-    ownedProcesses.set(key, proc);
-    proc.on("exit", () => {
-      if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
-    });
     if (options.message) {
       const channel = channelForProcess(proc);
-      const command = task !== void 0 ? { type: "follow_up", id: `reply-${randomUUID()}`, message: options.message } : { type: "prompt", id: `reply-${randomUUID()}`, message: options.message };
+      const command = task === void 0 ? { type: "prompt", id: `reply-${randomUUID()}`, message: options.message } : { type: "follow_up", id: `reply-${randomUUID()}`, message: options.message };
       await channel?.send(command);
     }
     return { outcome: "resumed", process: proc, record: await readRecord(runtimeDir, workerId) ?? record };
@@ -4857,12 +4890,18 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
   });
   const channel = createWorkerChannel(proc);
   channelByProcess.set(proc, channel);
+  const key = ownedKey(runtimeDir, record.id);
+  ownedProcesses.set(key, proc);
+  proc.on("exit", () => {
+    if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
+  });
   void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_started", { pid: proc.pid, invocation: [invocation.command, ...invocation.args] });
   let buffer = "";
   proc.stdout.on("data", (chunk) => {
     buffer += chunk.toString("utf8");
-    let newline;
-    while ((newline = buffer.indexOf("\n")) >= 0) {
+    for (; ; ) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
       const line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
       try {
@@ -5004,7 +5043,7 @@ function workersExtension(pi) {
   const lockedConfig = configFromEnvironment();
   let currentModel;
   let controlTimer;
-  const childProcesses = /* @__PURE__ */ new Map();
+  const childProcesses = ownedProcesses;
   const installGuestEventMap = () => {
     if (!ownWorkerId) return;
     const globals = globalThis;
@@ -5054,7 +5093,7 @@ function workersExtension(pi) {
     await writeRecord(runtimeDir, record);
     await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "worker_created", { parentId: record.parentId, callerModel: caller, tag: params.tag, model: route.model, depth });
     await mkdir(join(runtimeDir, "sessions"), { recursive: true, mode: 448 });
-    childProcesses.set(workerId, startWorkerProcess(ctx.cwd, runtimeDir, config, record, task, extensionPath));
+    startWorkerProcess(ctx.cwd, runtimeDir, config, record, task, extensionPath);
     if (params.wait) await waitForIdle(runtimeDir, workerId, ctx.signal);
     return readRecord(runtimeDir, workerId);
   };
@@ -5092,6 +5131,9 @@ function workersExtension(pi) {
               if (control.type === "abort") {
                 ctx.abort();
                 await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "applied", detail: "abort requested" });
+              } else if (control.type === "forward") {
+                const cfg = lockedConfig ?? await loadRootConfig(ctx.cwd);
+                await applyForwardControl(runtimeDir, ownWorkerId, control, { cwd: ctx.cwd, config: cfg, extensionPath });
               } else if (control.type === "prompt" && control.message) {
                 pi.sendUserMessage(control.message, { deliverAs: control.delivery ?? "steer" });
                 await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "applied", detail: `${control.delivery ?? "steer"} queued` });
@@ -5263,6 +5305,7 @@ export {
   abortWorker,
   acknowledgeControl,
   appendControl,
+  applyForwardControl,
   channelForProcess,
   controlFileFor,
   workersExtension as default,

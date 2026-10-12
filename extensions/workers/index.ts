@@ -76,9 +76,12 @@ interface WorkerRecord {
 
 interface ControlMessage {
 	id: string;
-	type: "prompt" | "abort";
+	type: "prompt" | "abort" | "forward";
 	message?: string;
 	delivery?: Delivery;
+	/** `forward` only: the nested worker this control is relayed to. */
+	targetWorkerId?: string;
+	inner?: { type: "steer" | "follow_up" | "prompt" | "abort"; message?: string };
 }
 
 interface ControlAck {
@@ -489,6 +492,57 @@ function channelForProcess(proc: ChildProcessWithoutNullStreams): WorkerChannel 
 	return channelByProcess.get(proc);
 }
 
+interface ForwardOutcome {
+	kind: "applied" | "rejected";
+	detail: string;
+}
+
+/**
+ * Apply a control relayed to one of this process's own children. Live children
+ * get the native RPC command on their channel; ended children are resumed on
+ * their pinned session for message controls. Every outcome is acked on the
+ * owner worker's event stream.
+ */
+async function applyForwardControl(runtimeDir: string, ownerId: string, control: ControlMessage, deps: { cwd: string; config: WorkersConfig; extensionPath: string; trackProcess?: (proc: ChildProcessWithoutNullStreams) => void }): Promise<ForwardOutcome> {
+	const target = typeof control.targetWorkerId === "string" ? control.targetWorkerId : undefined;
+	const inner = control.inner;
+	const fail = async (detail: string): Promise<ForwardOutcome> => {
+		await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: "rejected", detail });
+		return { kind: "rejected", detail };
+	};
+	if (!target) return fail("forward control is missing targetWorkerId");
+	if (!inner || !["steer", "follow_up", "prompt", "abort"].includes(inner.type)) return fail(`forward to ${target}: unsupported inner control type`);
+	if (inner.message !== undefined && inner.message.length > MAX_OUTPUT_CHARS) return fail(`forward to ${target}: message exceeds ${MAX_OUTPUT_CHARS} characters`);
+	const record = await readRecord(runtimeDir, target);
+	if (!record || record.parentId !== ownerId) return fail(`forward target ${target} is not a child of ${ownerId}`);
+
+	const proc = ownedProcesses.get(ownedKey(runtimeDir, target));
+	if (processIsLive(proc)) {
+		const channel = channelForProcess(proc);
+		if (!channel) return fail(`forward target ${target} has no RPC channel`);
+		try {
+			const command: Record<string, unknown> = inner.type === "abort"
+				? { type: "abort" }
+				: { type: inner.type, message: inner.message ?? "" };
+			const response = await channel.send(command);
+			const disposition = isObject(response.data) && typeof response.data.disposition === "string" ? response.data.disposition : undefined;
+			const detail = response.success === true
+				? `${inner.type} delivered to ${target}${disposition ? ` (${disposition})` : ""}`
+				: `${inner.type} rejected by ${target}: ${String(response.error ?? "unknown")}`;
+			await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: response.success === true ? "applied" : "rejected", detail });
+			return { kind: response.success === true ? "applied" : "rejected", detail };
+		} catch (error) {
+			return fail(`forward to ${target} failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	if (inner.type === "abort") return fail(`forward target ${target} is not running; nothing to abort`);
+	const resumed = await resumeWorker(runtimeDir, target, { cwd: deps.cwd, config: deps.config, extensionPath: deps.extensionPath, message: inner.message });
+	deps.trackProcess?.(resumed.process);
+	const detail = `resumed ${target} (attempt ${resumed.record.attempts ?? "?"}) and delivered ${inner.type}`;
+	await acknowledgeControl(runtimeDir, ownerId, { id: control.id, outcome: "applied", detail });
+	return { kind: "applied", detail };
+}
+
 interface ResumeOptions {
 	cwd: string;
 	config: WorkersConfig;
@@ -513,13 +567,17 @@ function processIsLive(proc: ChildProcessWithoutNullStreams | undefined): proc i
 	return Boolean(proc && proc.exitCode === null && proc.signalCode === null);
 }
 
+function ownedKey(runtimeDir: string, workerId: string): string {
+	return `${runtimeDir}\u0000${workerId}`;
+}
+
 /**
  * Restart an ended worker on its own pinned session and optionally deliver a
  * reply. Never replays an already-persisted initial task, never creates a
  * second process while one attempt is live or starting.
  */
 async function resumeWorker(runtimeDir: string, workerId: string, options: ResumeOptions): Promise<ResumeResult> {
-	const key = `${runtimeDir}\u0000${workerId}`;
+	const key = ownedKey(runtimeDir, workerId);
 	const owned = ownedProcesses.get(key);
 	if (processIsLive(owned) || processIsLive(options.liveProcess)) {
 		const proc = (processIsLive(owned) ? owned : options.liveProcess)!;
@@ -553,16 +611,12 @@ async function resumeWorker(runtimeDir: string, workerId: string, options: Resum
 		// an unpersisted one must be delivered or the worker never got its task.
 		const task = record.initialTaskPersisted ? undefined : record.initialTask;
 		const proc = startWorkerProcess(options.cwd, runtimeDir, options.config, updated ?? record, task, options.extensionPath);
-		ownedProcesses.set(key, proc);
-		proc.on("exit", () => {
-			if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
-		});
 		if (options.message) {
 			const channel = channelForProcess(proc);
 			// The original task goes as the initial prompt; the reply queues behind it.
-			const command = task !== undefined
-				? { type: "follow_up", id: `reply-${randomUUID()}`, message: options.message }
-				: { type: "prompt", id: `reply-${randomUUID()}`, message: options.message };
+			const command = task === undefined
+				? { type: "prompt", id: `reply-${randomUUID()}`, message: options.message }
+				: { type: "follow_up", id: `reply-${randomUUID()}`, message: options.message };
 			await channel?.send(command);
 		}
 		return { outcome: "resumed", process: proc, record: (await readRecord(runtimeDir, workerId)) ?? record };
@@ -595,12 +649,18 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 	});
 	const channel = createWorkerChannel(proc);
 	channelByProcess.set(proc, channel);
+	const key = ownedKey(runtimeDir, record.id);
+	ownedProcesses.set(key, proc);
+	proc.on("exit", () => {
+		if (ownedProcesses.get(key) === proc) ownedProcesses.delete(key);
+	});
 	void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_started", { pid: proc.pid, invocation: [invocation.command, ...invocation.args] });
 	let buffer = "";
 	proc.stdout.on("data", (chunk: Buffer) => {
 		buffer += chunk.toString("utf8");
-		let newline: number;
-		while ((newline = buffer.indexOf("\n")) >= 0) {
+		for (;;) {
+			const newline = buffer.indexOf("\n");
+			if (newline < 0) break;
 			const line = buffer.slice(0, newline);
 			buffer = buffer.slice(newline + 1);
 			try {
@@ -750,7 +810,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 	const lockedConfig = configFromEnvironment();
 	let currentModel: string | undefined;
 	let controlTimer: ReturnType<typeof setInterval> | undefined;
-	const childProcesses = new Map<string, ChildProcessWithoutNullStreams>();
+	const childProcesses = ownedProcesses;
 
 	const installGuestEventMap = () => {
 		if (!ownWorkerId) return;
@@ -795,7 +855,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 		await writeRecord(runtimeDir, record);
 		await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "worker_created", { parentId: record.parentId, callerModel: caller, tag: params.tag, model: route.model, depth });
 		await mkdir(join(runtimeDir, "sessions"), { recursive: true, mode: 0o700 });
-		childProcesses.set(workerId, startWorkerProcess(ctx.cwd, runtimeDir, config, record, task, extensionPath));
+		startWorkerProcess(ctx.cwd, runtimeDir, config, record, task, extensionPath);
 		if (params.wait) await waitForIdle(runtimeDir, workerId, ctx.signal);
 		return readRecord(runtimeDir, workerId);
 	};
@@ -837,6 +897,9 @@ export default function workersExtension(pi: ExtensionAPI) {
 							if (control.type === "abort") {
 								ctx.abort();
 								await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "applied", detail: "abort requested" });
+							} else if (control.type === "forward") {
+								const cfg = lockedConfig ?? await loadRootConfig(ctx.cwd);
+								await applyForwardControl(runtimeDir, ownWorkerId, control, { cwd: ctx.cwd, config: cfg, extensionPath });
 							} else if (control.type === "prompt" && control.message) {
 								pi.sendUserMessage(control.message, { deliverAs: control.delivery ?? "steer" });
 								await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "applied", detail: `${control.delivery ?? "steer"} queued` });
@@ -1001,4 +1064,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, channelForProcess, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, channelForProcess, controlFileFor, offsetFileFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, resumeWorker, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeControlOffset, writeRecord };
