@@ -367,6 +367,37 @@ async function pendingDialogsFor(runtimeDir: string, workerId: string): Promise<
 	return store ? [...store.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt)) : [];
 }
 
+interface PendingUiFromEvents {
+	workerId: string;
+	requestId: string;
+	method: string;
+	title?: string;
+}
+
+/** Derive pending dialogs for every worker from the shared event streams (nested included). */
+async function pendingDialogsFromEvents(runtimeDir: string): Promise<PendingUiFromEvents[]> {
+	const records = await listRecords(runtimeDir);
+	const pending: PendingUiFromEvents[] = [];
+	for (const record of records) {
+		const { events } = await readWorkerEvents(runtimeDir, record.id, 0, 10_000);
+		const open = new Map<string, PendingUiFromEvents>();
+		for (const event of events) {
+			if (event.kind !== "ui" || !isObject(event.data)) continue;
+			if (event.type === "ui_request" && event.data.category === "dialog" && typeof event.data.id === "string" && typeof event.data.method === "string") {
+				open.set(event.data.id, {
+					workerId: record.id,
+					requestId: event.data.id,
+					method: event.data.method,
+					...(typeof event.data.title === "string" ? { title: event.data.title } : {}),
+				});
+			}
+			if (event.type === "ui_answered" && typeof event.data.id === "string") open.delete(event.data.id);
+		}
+		pending.push(...open.values());
+	}
+	return pending;
+}
+
 /**
  * Register a dialog request as pending. Overflows auto-cancel back to the
  * child immediately so it never hangs on a dialog nobody can answer, and a
@@ -1372,7 +1403,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("workers", {
-		description: "Manage workers: status [id|all], query <id>, listen <id> [cursor], spawn <tag> <task>, reply <id> <message>, steer <id> <message>, resume <id>, abort <id>",
+		description: "Manage workers: status, query, listen, spawn, reply, steer, resume, ui, answer, abort",
 		handler: async (args, ctx) => {
 			const [action = "status", first, ...rest] = args.trim().split(/\s+/);
 			if (action === "status") {
@@ -1392,6 +1423,30 @@ export default function workersExtension(pi: ExtensionAPI) {
 				const since = rest[0] ? Number.parseInt(rest[0], 10) : 0;
 				const { events, nextCursor } = await readWorkerEvents(runtimeDir, first, Number.isFinite(since) ? since : 0);
 				ctx.ui.notify(`${events.map((event) => `[${event.seq}] ${event.kind}:${event.type} ${JSON.stringify(event.data)}`).join("\n") || "No events."}\nnextCursor: ${nextCursor}`, "info");
+				return;
+			}
+			if (action === "ui") {
+				const pending = await pendingDialogsFromEvents(runtimeDir);
+				ctx.ui.notify(
+					pending.length
+						? pending.map((entry) => `${entry.workerId}  ${entry.method}  ${entry.requestId}${entry.title ? `\n  ${entry.title}` : ""}`).join("\n\n")
+						: "No pending dialogs.",
+					"info",
+				);
+				return;
+			}
+			if (action === "answer") {
+				const [requestId, ...answer] = rest;
+				if (!first || !requestId || answer.length === 0) throw new Error("Usage: /workers answer <worker-id> <request-id> <cancel|yes|no|text>");
+				const text = answer.join(" ");
+				const response = text === "cancel" ? { cancelled: true as const }
+					: text === "yes" ? { confirmed: true as const }
+					: text === "no" ? { confirmed: false as const }
+					: { value: text };
+				const config = await getConfig(ctx.cwd);
+				const outcome = await deliverUiAnswer(runtimeDir, first, requestId, response, { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
+				if (outcome.kind === "rejected") throw new Error(outcome.detail);
+				ctx.ui.notify(outcome.detail, "info");
 				return;
 			}
 			if (action === "steer" || action === "reply") {
@@ -1425,7 +1480,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(worker ? `Worker started.\n${summarize(worker)}` : "Worker launch failed before a status record was available.", "info");
 				return;
 			}
-			throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | abort <id>");
+			throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | ui | answer <id> <request-id> <cancel|yes|no|text> | abort <id>");
 		},
 	});
 }
@@ -1433,4 +1488,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, formatWorkerEvents, offsetFileFor, pendingDialogsFor, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };
+export { abortWorker, acknowledgeControl, appendControl, applyForwardControl, cancelPendingDialogs, channelForProcess, classifyUiRequest, controlFileFor, deliverToWorker, deliverUiAnswer, formatWorkerEvents, offsetFileFor, pendingDialogsFor, pendingDialogsFromEvents, readAppliedControls, readControlOffset, readRecord, readWorkerEvents, registerPendingDialog, resolvePendingDialog, resumeWorker, sessionFileFor, startWorkerProcess, stopWorkerProcesses, workerInvocationArgs, writeControlOffset, writeRecord };

@@ -75,10 +75,23 @@ The root, any parent, and the user can query, listen to, steer, and abort nested
 /workers reply <worker-id> <message>
 /workers steer <worker-id> <message>
 /workers resume <worker-id>
+/workers ui
+/workers answer <worker-id> <request-id> <cancel|yes|no|text>
 /workers abort <worker-id>
 ```
 
 Delivery results say what happened: `sent` (live RPC delivery), `queued` (relayed to the owner process), `resumed` (restarted on its session), or a rejection with the reason. `/workers resume` restarts a direct child without a message; for a nested worker, reply and its parent will resume it.
+
+## Worker UI passthrough
+
+Extensions running inside a worker use Pi's supported RPC UI methods, and the parent forwards them as typed `ui` events on the worker's event stream: `select`, `confirm`, `input`, and `editor` become answerable dialogs; `notify`, `setStatus`, `setWidget`, `setTitle`, and `set_editor_text` are fire-and-forget. Anything else is rejected as `ui_rejected` instead of silently blocking the worker.
+
+- `/workers ui` lists pending dialogs across the tree (worker, method, request id, title).
+- `/workers answer <worker-id> <request-id> <text>` answers a select/input/editor dialog; `yes`/`no` answers a confirm; `cancel` dismisses any dialog.
+- Dialog state is derived from the event stream (`ui_request` − `ui_answered`), so nested workers work the same way; answers relay through the process that owns the child.
+- Pending dialogs cancel automatically when a worker exits or the runtime shuts down, and late answers are rejected.
+
+TUI-only APIs such as `ctx.ui.custom()` are not forwarded over RPC; they are inert inside workers.
 
 ## Transcripts and guest events
 

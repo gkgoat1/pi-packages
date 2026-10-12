@@ -4653,6 +4653,28 @@ async function pendingDialogsFor(runtimeDir, workerId) {
   const store = pendingDialogs.get(pendingKey(runtimeDir, workerId));
   return store ? [...store.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt)) : [];
 }
+async function pendingDialogsFromEvents(runtimeDir) {
+  const records = await listRecords(runtimeDir);
+  const pending = [];
+  for (const record of records) {
+    const { events } = await readWorkerEvents(runtimeDir, record.id, 0, 1e4);
+    const open = /* @__PURE__ */ new Map();
+    for (const event of events) {
+      if (event.kind !== "ui" || !isObject(event.data)) continue;
+      if (event.type === "ui_request" && event.data.category === "dialog" && typeof event.data.id === "string" && typeof event.data.method === "string") {
+        open.set(event.data.id, {
+          workerId: record.id,
+          requestId: event.data.id,
+          method: event.data.method,
+          ...typeof event.data.title === "string" ? { title: event.data.title } : {}
+        });
+      }
+      if (event.type === "ui_answered" && typeof event.data.id === "string") open.delete(event.data.id);
+    }
+    pending.push(...open.values());
+  }
+  return pending;
+}
 async function registerPendingDialog(runtimeDir, workerId, payload, proc) {
   const requestId = typeof payload.id === "string" ? payload.id : void 0;
   const method = typeof payload.method === "string" ? payload.method : "unknown";
@@ -5502,7 +5524,7 @@ ${transcript}`).join("\n\n---\n\n"), { workers });
     }
   });
   pi.registerCommand("workers", {
-    description: "Manage workers: status [id|all], query <id>, listen <id> [cursor], spawn <tag> <task>, reply <id> <message>, steer <id> <message>, resume <id>, abort <id>",
+    description: "Manage workers: status, query, listen, spawn, reply, steer, resume, ui, answer, abort",
     handler: async (args, ctx) => {
       const [action = "status", first, ...rest] = args.trim().split(/\s+/);
       if (action === "status") {
@@ -5526,6 +5548,26 @@ ${await transcriptSummary(record, 20)}`, "info");
         const { events, nextCursor } = await readWorkerEvents(runtimeDir, first, Number.isFinite(since) ? since : 0);
         ctx.ui.notify(`${events.map((event) => `[${event.seq}] ${event.kind}:${event.type} ${JSON.stringify(event.data)}`).join("\n") || "No events."}
 nextCursor: ${nextCursor}`, "info");
+        return;
+      }
+      if (action === "ui") {
+        const pending = await pendingDialogsFromEvents(runtimeDir);
+        ctx.ui.notify(
+          pending.length ? pending.map((entry) => `${entry.workerId}  ${entry.method}  ${entry.requestId}${entry.title ? `
+  ${entry.title}` : ""}`).join("\n\n") : "No pending dialogs.",
+          "info"
+        );
+        return;
+      }
+      if (action === "answer") {
+        const [requestId, ...answer] = rest;
+        if (!first || !requestId || answer.length === 0) throw new Error("Usage: /workers answer <worker-id> <request-id> <cancel|yes|no|text>");
+        const text = answer.join(" ");
+        const response = text === "cancel" ? { cancelled: true } : text === "yes" ? { confirmed: true } : text === "no" ? { confirmed: false } : { value: text };
+        const config = await getConfig(ctx.cwd);
+        const outcome = await deliverUiAnswer(runtimeDir, first, requestId, response, { cwd: ctx.cwd, config, extensionPath, ownWorkerId });
+        if (outcome.kind === "rejected") throw new Error(outcome.detail);
+        ctx.ui.notify(outcome.detail, "info");
         return;
       }
       if (action === "steer" || action === "reply") {
@@ -5560,7 +5602,7 @@ nextCursor: ${nextCursor}`, "info");
 ${summarize(worker)}` : "Worker launch failed before a status record was available.", "info");
         return;
       }
-      throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | abort <id>");
+      throw new Error("Usage: /workers status [id|all] | query <id> | listen <id> [cursor] | spawn <tag> <task> | reply <id> <message> | steer <id> <message> | resume <id> | ui | answer <id> <request-id> <cancel|yes|no|text> | abort <id>");
     }
   });
 }
@@ -5579,6 +5621,7 @@ export {
   formatWorkerEvents,
   offsetFileFor,
   pendingDialogsFor,
+  pendingDialogsFromEvents,
   readAppliedControls,
   readControlOffset,
   readRecord,

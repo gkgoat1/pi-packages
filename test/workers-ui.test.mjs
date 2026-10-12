@@ -7,7 +7,7 @@ import test from "node:test";
 const root = resolve(import.meta.dirname, "..");
 const fixturePath = join(root, "fixtures", "fake-rpc-worker.mjs");
 
-const { classifyUiRequest, formatWorkerEvents, pendingDialogsFor, readWorkerEvents, registerPendingDialog, resolvePendingDialog, sessionFileFor, startWorkerProcess, stopWorkerProcesses, writeRecord } = await import("../extensions/workers/index.ts");
+const { classifyUiRequest, formatWorkerEvents, pendingDialogsFor, pendingDialogsFromEvents, readWorkerEvents, registerPendingDialog, resolvePendingDialog, sessionFileFor, startWorkerProcess, stopWorkerProcesses, writeRecord } = await import("../extensions/workers/index.ts");
 
 const config = { maxDepth: 2, maxWorkers: 4, models: {} };
 
@@ -163,6 +163,35 @@ test("the 65th pending dialog on one worker is auto-cancelled, not stored", asyn
 			const { events } = await readWorkerEvents(runtimeDir, workerId);
 			return events.some((event) => event.kind === "ui" && event.type === "ui_answered" && event.data?.id === "dlg-64" && event.data?.outcome === "cancelled");
 		});
+	});
+});
+
+test("pending dialogs derive from the event stream across the tree", async () => {
+	await withWorker("ui00011", "emit-ui-dialogs", async ({ runtimeDir, proc, workerId }) => {
+		const derived = await waitFor(async () => {
+			const list = await pendingDialogsFromEvents(runtimeDir);
+			return list.length === 1 ? list : undefined;
+		});
+		assert.equal(derived[0]?.workerId, workerId);
+		assert.equal(derived[0]?.method, "select");
+		assert.equal(derived[0]?.title, "Allow dangerous command?");
+		assert.ok(derived[0]?.requestId);
+		proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: derived[0].requestId, cancelled: true })}\n`);
+		await waitFor(async () => (await pendingDialogsFromEvents(runtimeDir)).length >= 1, 5000).catch(() => undefined);
+		void 0;
+	});
+});
+
+test("answered dialogs drop out of the event-derived pending list", async () => {
+	await withWorker("ui00012", "emit-ui-dialogs", async ({ runtimeDir, workerId }) => {
+		await waitFor(async () => (await pendingDialogsFromEvents(runtimeDir)).length === 1);
+		const pending = (await pendingDialogsFor(runtimeDir, workerId))[0];
+		await resolvePendingDialog(runtimeDir, workerId, pending.requestId, "cancelled", "dismissed");
+		const derived = await waitFor(async () => {
+			const list = await pendingDialogsFromEvents(runtimeDir);
+			return list.some((entry) => entry.requestId === pending.requestId) ? undefined : list;
+		});
+		assert.equal(derived.some((entry) => entry.requestId === pending.requestId), false);
 	});
 });
 
