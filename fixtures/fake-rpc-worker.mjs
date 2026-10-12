@@ -101,6 +101,11 @@ function handlePrompt(command) {
 		streaming = true;
 		write({ type: "agent_start" });
 		// Stays open until abort or stdin end.
+	} else if (message === "provider-error") {
+		streaming = true;
+		write({ type: "agent_start" });
+		write({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "529 provider overloaded", timestamp: Date.now() } });
+		settle(false);
 	} else {
 		runEcho(message);
 	}

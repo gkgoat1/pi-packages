@@ -4689,6 +4689,17 @@ async function markInitialTaskPersisted(runtimeDir, workerId) {
     record.initialTaskPersisted = true;
   });
 }
+async function settleWorker(runtimeDir, workerId) {
+  await mutateRecord(runtimeDir, workerId, (record) => {
+    if (record.status === "starting" || record.status === "running") record.status = "idle";
+  });
+}
+async function abortWorker(runtimeDir, workerId) {
+  await sendControl(runtimeDir, workerId, { type: "abort" });
+  await mutateRecord(runtimeDir, workerId, (record) => {
+    record.status = "aborted";
+  });
+}
 function transcriptLine(entry) {
   if (!isObject(entry)) return JSON.stringify(entry);
   if (entry.type === "session") return `session ${typeof entry.id === "string" ? entry.id : ""}`;
@@ -4757,8 +4768,11 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
         if (event.type === "message_end") {
           const output = finalText(event.message);
           if (output) void updateWorkerOutput(runtimeDir, record.id, output, "running");
+          if (isObject(event.message) && event.message.stopReason === "error" && typeof event.message.errorMessage === "string") {
+            void updateWorkerOutput(runtimeDir, record.id, void 0, void 0, event.message.errorMessage);
+          }
         }
-        if (event.type === "agent_settled") void updateWorkerOutput(runtimeDir, record.id, void 0, "idle");
+        if (event.type === "agent_settled") void settleWorker(runtimeDir, record.id);
       } catch {
         void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "invalid_stdout", line.slice(0, 2e3));
       }
@@ -4773,9 +4787,12 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
   proc.on("exit", (code, signal) => {
     void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_exit", { code, signal, stderr: stderr.slice(-4e3) });
     void (async () => {
-      const current = await readRecord(runtimeDir, record.id);
-      if (!current || current.status === "aborted") return;
-      await updateWorkerOutput(runtimeDir, record.id, void 0, code === 0 ? "exited" : "error", stderr || `Worker exited (${signal ?? code ?? "unknown"}).`);
+      await mutateRecord(runtimeDir, record.id, (current) => {
+        if (current.status === "aborted") return;
+        const cleanExit = code === 0 || signal !== null && ["idle", "error", "exited"].includes(current.status);
+        current.status = cleanExit ? "exited" : "error";
+        if (!cleanExit) current.error = (stderr || `Worker exited (${signal ?? code ?? "unknown"}).`).slice(-4e3);
+      });
     })();
   });
   proc.stdin.on("error", () => {
@@ -5062,8 +5079,7 @@ nextCursor: ${nextCursor}`, "info");
       }
       if (action === "abort") {
         if (!first) throw new Error("Usage: /workers abort <worker-id>");
-        await sendControl(runtimeDir, first, { type: "abort" });
-        await updateWorkerOutput(runtimeDir, first, void 0, "aborted");
+        await abortWorker(runtimeDir, first);
         ctx.ui.notify(`Abort requested for ${first}.`, "warning");
         return;
       }
@@ -5079,6 +5095,7 @@ ${summarize(worker)}` : "Worker launch failed before a status record was availab
   });
 }
 export {
+  abortWorker,
   workersExtension as default,
   readRecord,
   readWorkerEvents,

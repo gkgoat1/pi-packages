@@ -368,6 +368,21 @@ async function markInitialTaskPersisted(runtimeDir: string, workerId: string): P
 	});
 }
 
+/** Settle to idle only from a live state, so an abort wins over a late settle. */
+async function settleWorker(runtimeDir: string, workerId: string): Promise<void> {
+	await mutateRecord(runtimeDir, workerId, (record) => {
+		if (record.status === "starting" || record.status === "running") record.status = "idle";
+	});
+}
+
+/** Mark a worker aborted and notify its process; the status survives the exit. */
+async function abortWorker(runtimeDir: string, workerId: string): Promise<void> {
+	await sendControl(runtimeDir, workerId, { type: "abort" });
+	await mutateRecord(runtimeDir, workerId, (record) => {
+		record.status = "aborted";
+	});
+}
+
 function transcriptLine(entry: unknown): string {
 	if (!isObject(entry)) return JSON.stringify(entry);
 	if (entry.type === "session") return `session ${typeof entry.id === "string" ? entry.id : ""}`;
@@ -438,8 +453,13 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 				if (event.type === "message_end") {
 					const output = finalText(event.message);
 					if (output) void updateWorkerOutput(runtimeDir, record.id, output, "running");
+					// Provider failures surface on the final assistant message, not on
+					// the command response; retain the detail so the worker is resumable.
+					if (isObject(event.message) && event.message.stopReason === "error" && typeof event.message.errorMessage === "string") {
+						void updateWorkerOutput(runtimeDir, record.id, undefined, undefined, event.message.errorMessage);
+					}
 				}
-				if (event.type === "agent_settled") void updateWorkerOutput(runtimeDir, record.id, undefined, "idle");
+				if (event.type === "agent_settled") void settleWorker(runtimeDir, record.id);
 			} catch {
 				void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "invalid_stdout", line.slice(0, 2000));
 			}
@@ -454,9 +474,12 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 	proc.on("exit", (code, signal) => {
 		void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "process_exit", { code, signal, stderr: stderr.slice(-4000) });
 		void (async () => {
-			const current = await readRecord(runtimeDir, record.id);
-			if (!current || current.status === "aborted") return;
-			await updateWorkerOutput(runtimeDir, record.id, undefined, code === 0 ? "exited" : "error", stderr || `Worker exited (${signal ?? code ?? "unknown"}).`);
+			await mutateRecord(runtimeDir, record.id, (current) => {
+				if (current.status === "aborted") return;
+				const cleanExit = code === 0 || (signal !== null && ["idle", "error", "exited"].includes(current.status));
+				current.status = cleanExit ? "exited" : "error";
+				if (!cleanExit) current.error = (stderr || `Worker exited (${signal ?? code ?? "unknown"}).`).slice(-4000);
+			});
 		})();
 	});
 	proc.stdin.on("error", () => { /* surfaced via process error/exit handlers */ });
@@ -731,8 +754,7 @@ export default function workersExtension(pi: ExtensionAPI) {
 			}
 			if (action === "abort") {
 				if (!first) throw new Error("Usage: /workers abort <worker-id>");
-				await sendControl(runtimeDir, first, { type: "abort" });
-				await updateWorkerOutput(runtimeDir, first, undefined, "aborted");
+				await abortWorker(runtimeDir, first);
 				ctx.ui.notify(`Abort requested for ${first}.`, "warning");
 				return;
 			}
@@ -750,4 +772,4 @@ export default function workersExtension(pi: ExtensionAPI) {
 // Named exports for deterministic protocol tests (fixtures drive this module's
 // process boundary without a real Pi child); the default export stays the
 // extension factory.
-export { readRecord, readWorkerEvents, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeRecord };
+export { abortWorker, readRecord, readWorkerEvents, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeRecord };
