@@ -353,7 +353,7 @@ test("gondolin shared handle installs and reads via the registered symbol", () =
 		mounts: [],
 		isEnabled: () => true,
 		refreshTrust: () => true,
-		ensureVm: async () => null,
+		ensureVm: async () => null as unknown as VM,
 		getVm: () => null,
 		toGuestPath: (p) => p,
 		registerFsGuard: () => () => {},

@@ -23,13 +23,12 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "check": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.mcp.json",
+    "check": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.extensions.json",
     "build": "node scripts/build.mjs",
     "test": "node --import tsx --test",
     "test:pi": "npm run build && node --test test/workers-bundle.test.mjs test/gondolin-bundle.test.mjs test/radare2-bundle.test.mjs"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "esbuild": "^0.28.0",
     "tsx": "^4.19.4",
     "typescript": "^5.7.3"
@@ -43,7 +42,6 @@
   "pi": {
     "extensions": [
       "./dist/file-guard",
-      "./dist/mcp-client",
       "./dist/workers",
       "./dist/thinking-compression",
       "./dist/gondolin",

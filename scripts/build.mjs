@@ -2,7 +2,7 @@
  * Bundle every Pi extension in this package into ./dist/<name>/index.js.
  *
  * Each bundle is a self-contained ES module. Non-Pi dependencies
- * (@modelcontextprotocol/sdk, typebox, and their transitive deps) are inlined
+ * (typebox and its transitive deps) are inlined
  * so the extensions load even when this package's node_modules is cleared.
  * Pi-provided packages (@earendil-works/*) and Node builtins stay external:
  * Pi resolves them at runtime via jiti aliases and the host install.

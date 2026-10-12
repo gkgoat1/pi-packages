@@ -2,19 +2,19 @@
  * The cross-extension Gondolin shared handle.
  *
  * Extensions in this package are bundled separately and must not depend on
- * each other. To let File Guard and the MCP client reuse the sandbox VM
+ * each other. To let File Guard and radare2 reuse the sandbox VM
  * without a dependency, the Gondolin extension publishes a handle on
  * `globalThis` under a registered symbol (`Symbol.for`), so every bundle in
  * the same Pi process resolves the same value. Consumers mirror the minimal
  * structural contract below (see `extensions/file-guard/src/gondolin.ts` and
- * `extensions/mcp-client/src/vm.ts`); TypeScript structural typing keeps the
+ * `extensions/radare2/src/sandbox/index.ts`); TypeScript structural typing keeps the
  * copies compatible without imports.
  *
  * The handle exposes:
  * - the VM itself (`ensureVm`/`getVm`) plus the host↔guest workspace mapping,
  * - VM-filesystem guards: before/after hooks on every operation against the
  *   mounted host workspace (this is File Guard's interception mode),
- * - `execGuest`: long-running guest processes with piped stdio (MCP servers).
+ * - `execGuest`: long-running guest processes with piped stdio (radare2 analysis).
  */
 
 import { existsSync } from "node:fs";
@@ -106,9 +106,9 @@ export interface GondolinShared {
 	 */
 	refreshTrust(isProjectTrusted: boolean): boolean;
 	/** Boot (or return the running) sandbox VM. */
-	ensureVm(): Promise<unknown>;
+	ensureVm(): Promise<VM>;
 	/** The running VM, or null while stopped. */
-	getVm(): unknown;
+	getVm(): VM | null;
 	/** Map a host path (under the workspace or any extra mount) to its guest path. */
 	toGuestPath(hostPath: string): string | undefined;
 	/**

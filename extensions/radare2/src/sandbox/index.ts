@@ -11,7 +11,7 @@
  * - both: optional Gondolin VM backend (`sandbox.backend: "gondolin"`).
  *
  * Gondolin integration mirrors the minimal structural handle contract used by
- * extensions/mcp-client and extensions/file-guard (separately bundled
+ * extensions/file-guard (separately bundled
  * extensions stay dependency-free; values are matched at runtime through the
  * shared registered symbol).
  */
