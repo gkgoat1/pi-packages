@@ -26,6 +26,7 @@ const GUEST_EVENTS_PROPERTY = "PI_WORKERS_EVENTS";
 const GUEST_EVENTS_SYMBOL = Symbol.for("pi.workers.events");
 const EXTENSION_INSTANCE_SYMBOL = Symbol.for("pi.workers.extension.active");
 const eventWriteQueues = new Map<string, Promise<void>>();
+const recordMutationQueues = new Map<string, Promise<void>>();
 
 type Delivery = "steer" | "followUp";
 
@@ -61,6 +62,10 @@ interface WorkerRecord {
 	createdAt: string;
 	updatedAt: string;
 	sessionFile?: string;
+	/** The initial task, kept so a pre-persistence crash stays distinguishable from a settled worker. */
+	initialTask?: string;
+	/** True once the child accepted the initial prompt; a resume must not send it again. */
+	initialTaskPersisted?: boolean;
 	lastOutput?: string;
 	error?: string;
 	pid?: number;
@@ -87,10 +92,6 @@ const SpawnParams = Type.Object({
 	task: Type.String({ description: "Initial task for the worker" }),
 	name: Type.Optional(Type.String({ description: "Optional human label included in the task" })),
 	wait: Type.Optional(Type.Boolean({ description: "Wait until the worker becomes idle before returning (default false)" })),
-});
-
-const WorkerIdParams = Type.Object({
-	workerId: Type.String({ description: "Worker id returned by workers_spawn, or 'all'" }),
 });
 
 const QueryParams = Type.Object({
@@ -209,6 +210,9 @@ function controlFile(runtimeDir: string, workerId: string): string {
 function eventFile(runtimeDir: string, workerId: string): string {
 	return join(runtimeDir, "events", `${workerId}.jsonl`);
 }
+function sessionFileFor(runtimeDir: string, workerId: string): string {
+	return join(runtimeDir, "sessions", `${workerId}.jsonl`);
+}
 
 async function writeRecord(runtimeDir: string, record: WorkerRecord): Promise<void> {
 	await mkdir(join(runtimeDir, "workers"), { recursive: true, mode: 0o700 });
@@ -223,6 +227,31 @@ async function readRecord(runtimeDir: string, workerId: string): Promise<WorkerR
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Serialize read-modify-write cycles per worker. Concurrent stdout handlers
+ * (prompt response, message end, settle, exit) otherwise clobber each other's
+ * fields by writing back stale snapshots.
+ */
+async function mutateRecord(runtimeDir: string, workerId: string, mutate: (record: WorkerRecord) => void): Promise<WorkerRecord | undefined> {
+	const key = `${runtimeDir}\u0000${workerId}`;
+	const previous = recordMutationQueues.get(key) ?? Promise.resolve();
+	let result: WorkerRecord | undefined;
+	const operation = previous.catch(() => undefined).then(async () => {
+		const record = await readRecord(runtimeDir, workerId);
+		if (!record) return;
+		mutate(record);
+		await writeRecord(runtimeDir, record);
+		result = record;
+	});
+	recordMutationQueues.set(key, operation);
+	try {
+		await operation;
+	} finally {
+		if (recordMutationQueues.get(key) === operation) recordMutationQueues.delete(key);
+	}
+	return result;
 }
 
 async function listRecords(runtimeDir: string): Promise<WorkerRecord[]> {
@@ -251,10 +280,27 @@ function finalText(message: unknown): string | undefined {
 }
 
 function piInvocation(args: string[]): { command: string; args: string[] } {
+	// Test seam: point at a deterministic RPC fixture instead of the real CLI.
+	const fixture = process.env.PI_WORKERS_PI_SCRIPT;
+	if (fixture) return { command: process.execPath, args: [fixture, ...args] };
 	const script = process.argv[1];
 	if (script && existsSync(script) && !script.startsWith("/$bunfs/root/")) return { command: process.execPath, args: [script, ...args] };
 	const executable = process.execPath.split(/[\\/]/).pop()?.toLowerCase() ?? "";
 	return /^(node|bun)(\.exe)?$/.test(executable) ? { command: "pi", args } : { command: process.execPath, args };
+}
+
+/**
+ * CLI arguments for one worker attempt. `--session` pins the append-only Pi
+ * transcript to a path derived from the worker id, so a restarted attempt
+ * reopens the same conversation instead of starting a new one.
+ */
+function workerInvocationArgs(record: WorkerRecord, extensionPath: string): string[] {
+	if (!record.sessionFile) throw new Error(`Worker ${record.id} has no session file; records must carry a stable session path before launch.`);
+	return [
+		"--mode", "rpc", "--approve", "--model", record.model, "--name", `worker-${record.id}`,
+		"--session", record.sessionFile,
+		"--extension", extensionPath,
+	];
 }
 
 type SafeEventData = string | number | boolean | null | unknown[] | { [key: string]: unknown };
@@ -309,12 +355,17 @@ async function readWorkerEvents(runtimeDir: string, workerId: string, since = 0,
 }
 
 async function updateWorkerOutput(runtimeDir: string, workerId: string, output?: string, status?: WorkerStatus, error?: string): Promise<void> {
-	const record = await readRecord(runtimeDir, workerId);
-	if (!record) return;
-	if (output) record.lastOutput = output.slice(-MAX_OUTPUT_CHARS);
-	if (status) record.status = status;
-	if (error) record.error = error.slice(-4000);
-	await writeRecord(runtimeDir, record);
+	await mutateRecord(runtimeDir, workerId, (record) => {
+		if (output) record.lastOutput = output.slice(-MAX_OUTPUT_CHARS);
+		if (status) record.status = status;
+		if (error) record.error = error.slice(-4000);
+	});
+}
+
+async function markInitialTaskPersisted(runtimeDir: string, workerId: string): Promise<void> {
+	await mutateRecord(runtimeDir, workerId, (record) => {
+		record.initialTaskPersisted = true;
+	});
 }
 
 function transcriptLine(entry: unknown): string {
@@ -351,13 +402,12 @@ async function transcriptSummary(record: WorkerRecord, tail: number): Promise<st
 	}
 }
 
-function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConfig, record: WorkerRecord, task: string, extensionPath: string): ChildProcessWithoutNullStreams {
-	// Do NOT use --no-extensions or --no-session. A worker has its own persisted
+function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConfig, record: WorkerRecord, task: string | undefined, extensionPath: string): ChildProcessWithoutNullStreams {
+	// Do NOT use --no-session or --no-extensions. A worker has its own persisted
 	// Pi transcript and normal project/global extensions, plus this extension.
-	const invocation = piInvocation([
-		"--mode", "rpc", "--approve", "--model", record.model, "--name", `worker-${record.id}`,
-		"--extension", extensionPath,
-	]);
+	// The initial task goes over stdin only on the first attempt; a resume with
+	// `task === undefined` reopens `--session` and must not replay it.
+	const invocation = piInvocation(workerInvocationArgs(record, extensionPath));
 	const proc = spawn(invocation.command, invocation.args, {
 		cwd,
 		stdio: ["pipe", "pipe", "pipe"],
@@ -381,6 +431,10 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 			try {
 				const event = JSON.parse(line);
 				void appendWorkerEvent(runtimeDir, record.id, "pi", typeof event.type === "string" ? event.type : "unknown", event);
+				if (event.type === "response" && event.command === "prompt" && event.id === `initial-${record.id}`) {
+					if (event.success === true) void markInitialTaskPersisted(runtimeDir, record.id);
+					else void updateWorkerOutput(runtimeDir, record.id, undefined, "error", `Initial prompt rejected: ${String(event.error ?? "unknown error")}`);
+				}
 				if (event.type === "message_end") {
 					const output = finalText(event.message);
 					if (output) void updateWorkerOutput(runtimeDir, record.id, output, "running");
@@ -405,7 +459,11 @@ function startWorkerProcess(cwd: string, runtimeDir: string, config: WorkersConf
 			await updateWorkerOutput(runtimeDir, record.id, undefined, code === 0 ? "exited" : "error", stderr || `Worker exited (${signal ?? code ?? "unknown"}).`);
 		})();
 	});
-	proc.stdin.write(`${JSON.stringify({ type: "prompt", id: `initial-${record.id}`, message: task })}\n`);
+	proc.stdin.on("error", () => { /* surfaced via process error/exit handlers */ });
+	if (task !== undefined) {
+		proc.stdin.write(`${JSON.stringify({ type: "prompt", id: `initial-${record.id}`, message: task })}\n`);
+		void appendWorkerEvent(runtimeDir, record.id, "lifecycle", "initial_prompt_sent", { id: `initial-${record.id}` });
+	}
 	return proc;
 }
 
@@ -493,13 +551,15 @@ export default function workersExtension(pi: ExtensionAPI) {
 		if (existing.length >= config.maxWorkers) throw new Error(`Worker cap reached (${config.maxWorkers}).`);
 
 		const workerId = randomUUID().slice(0, 8);
+		const task = `${params.name ? `[Worker: ${params.name}]\n` : ""}${params.task}`;
 		const record: WorkerRecord = {
 			id: workerId, parentId: parent?.id ?? null, depth, model: route.model, tag: params.tag, callerModel: caller, lineageRoutes,
 			status: "starting", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+			sessionFile: sessionFileFor(runtimeDir, workerId), initialTask: task, initialTaskPersisted: false,
 		};
 		await writeRecord(runtimeDir, record);
 		await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "worker_created", { parentId: record.parentId, callerModel: caller, tag: params.tag, model: route.model, depth });
-		const task = `${params.name ? `[Worker: ${params.name}]\n` : ""}${params.task}`;
+		await mkdir(join(runtimeDir, "sessions"), { recursive: true, mode: 0o700 });
 		childProcesses.set(workerId, startWorkerProcess(ctx.cwd, runtimeDir, config, record, task, extensionPath));
 		if (params.wait) await waitForIdle(runtimeDir, workerId, ctx.signal);
 		return readRecord(runtimeDir, workerId);
@@ -686,3 +746,8 @@ export default function workersExtension(pi: ExtensionAPI) {
 		},
 	});
 }
+
+// Named exports for deterministic protocol tests (fixtures drive this module's
+// process boundary without a real Pi child); the default export stays the
+// extension factory.
+export { readRecord, readWorkerEvents, sessionFileFor, startWorkerProcess, workerInvocationArgs, writeRecord };
