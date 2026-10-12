@@ -305,6 +305,12 @@ test("gondolin http hooks inflate stubs to real keys only for allowed hosts", as
 test("gondolin extension leaves tools local while disabled", async () => {
 	delete process.env.PI_GONDOLIN_ENABLED;
 	delete process.env.PI_GONDOLIN_CONFIG;
+	// Isolate HOME: a real ~/.pi/agent/gondolin.json with enabled:true would
+	// otherwise flip this "disabled" test onto the VM path.
+	const isolatedHome = await mkdtemp(join(tmpdir(), "pi-gondolin-test-home-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = isolatedHome;
+	try {
 	const { default: gondolinExtension } = await import("../index.ts");
 
 	const tools = new Map<string, { name: string; execute: (id: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }> }>();
@@ -327,6 +333,11 @@ test("gondolin extension leaves tools local while disabled", async () => {
 		assert.equal(result.content[0]?.text.includes("local content"), true);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
+	}
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		await rm(isolatedHome, { recursive: true, force: true });
 	}
 });
 
