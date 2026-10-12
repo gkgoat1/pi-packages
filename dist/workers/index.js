@@ -4538,6 +4538,12 @@ function workerFile(runtimeDir, workerId) {
 function controlFile(runtimeDir, workerId) {
   return join(runtimeDir, "controls", `${workerId}.jsonl`);
 }
+function controlFileFor(runtimeDir, workerId) {
+  return controlFile(runtimeDir, workerId);
+}
+function offsetFileFor(runtimeDir, workerId) {
+  return join(runtimeDir, "controls", `${workerId}.offset`);
+}
 function eventFile(runtimeDir, workerId) {
   return join(runtimeDir, "events", `${workerId}.jsonl`);
 }
@@ -4695,7 +4701,7 @@ async function settleWorker(runtimeDir, workerId) {
   });
 }
 async function abortWorker(runtimeDir, workerId) {
-  await sendControl(runtimeDir, workerId, { type: "abort" });
+  await appendControl(runtimeDir, workerId, { type: "abort" });
   await mutateRecord(runtimeDir, workerId, (record) => {
     record.status = "aborted";
   });
@@ -4804,11 +4810,55 @@ function startWorkerProcess(cwd, runtimeDir, config, record, task, extensionPath
   }
   return proc;
 }
-async function sendControl(runtimeDir, workerId, control) {
+async function appendControl(runtimeDir, workerId, control) {
   if (!await readRecord(runtimeDir, workerId)) throw new Error(`Unknown worker: ${workerId}`);
   await mkdir(join(runtimeDir, "controls"), { recursive: true, mode: 448 });
-  await appendFile(controlFile(runtimeDir, workerId), `${JSON.stringify({ ...control, id: randomUUID() })}
+  const entry = { ...control, id: randomUUID() };
+  await appendFile(controlFile(runtimeDir, workerId), `${JSON.stringify(entry)}
 `, { mode: 384 });
+  return entry;
+}
+async function readAppliedControls(runtimeDir, workerId, offset) {
+  let contents;
+  try {
+    contents = await readFile(controlFile(runtimeDir, workerId), "utf8");
+  } catch {
+    return { entries: [], malformed: 0, nextOffset: 0, clamped: offset > 0 };
+  }
+  const clamped = offset > contents.length;
+  const unread = clamped ? "" : contents.slice(offset);
+  const entries = [];
+  let malformed = 0;
+  for (const line of unread.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const control = JSON.parse(line);
+      if (typeof control.id === "string" && typeof control.type === "string") entries.push(control);
+      else malformed += 1;
+    } catch {
+      malformed += 1;
+    }
+  }
+  return { entries, malformed, nextOffset: contents.length, clamped };
+}
+async function readControlOffset(runtimeDir, workerId) {
+  try {
+    const parsed = Number.parseInt(await readFile(offsetFileFor(runtimeDir, workerId), "utf8"), 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+async function writeControlOffset(runtimeDir, workerId, offset) {
+  await mkdir(join(runtimeDir, "controls"), { recursive: true, mode: 448 });
+  await writeFile(offsetFileFor(runtimeDir, workerId), String(offset), { mode: 384 });
+}
+async function acknowledgeControl(runtimeDir, workerId, ack) {
+  await appendWorkerEvent(runtimeDir, workerId, "lifecycle", "control_ack", {
+    id: ack.id,
+    outcome: ack.outcome,
+    ...ack.detail ? { detail: ack.detail.slice(0, 500) } : {}
+  });
 }
 async function waitForIdle(runtimeDir, workerId, signal) {
   while (!signal?.aborted) {
@@ -4849,7 +4899,6 @@ function workersExtension(pi) {
   const ownWorkerId = process.env.PI_WORKERS_WORKER_ID;
   const lockedConfig = configFromEnvironment();
   let currentModel;
-  let controlsOffset = 0;
   let controlTimer;
   const childProcesses = /* @__PURE__ */ new Map();
   const installGuestEventMap = () => {
@@ -4922,31 +4971,43 @@ function workersExtension(pi) {
       if (record) {
         record.status = "running";
         record.pid = process.pid;
-        record.sessionFile = ctx.sessionManager.getSessionFile();
+        if (!record.sessionFile) record.sessionFile = ctx.sessionManager.getSessionFile();
         await writeRecord(runtimeDir, record);
         await appendWorkerEvent(runtimeDir, ownWorkerId, "lifecycle", "session_started", { sessionFile: record.sessionFile, pid: process.pid });
       }
       installGuestEventMap();
+      let controlsOffset = await readControlOffset(runtimeDir, ownWorkerId);
+      let polling = false;
       controlTimer = setInterval(() => {
+        if (polling) return;
+        polling = true;
         void (async () => {
-          let contents;
-          try {
-            contents = await readFile(controlFile(runtimeDir, ownWorkerId), "utf8");
-          } catch {
-            return;
-          }
-          const unread = contents.slice(controlsOffset);
-          controlsOffset = contents.length;
-          for (const line of unread.split("\n")) {
-            if (!line.trim()) continue;
+          const read = await readAppliedControls(runtimeDir, ownWorkerId, controlsOffset);
+          for (const control of read.entries) {
             try {
-              const control = JSON.parse(line);
-              if (control.type === "abort") ctx.abort();
-              if (control.type === "prompt" && control.message) pi.sendUserMessage(control.message, { deliverAs: control.delivery ?? "steer" });
-            } catch {
+              if (control.type === "abort") {
+                ctx.abort();
+                await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "applied", detail: "abort requested" });
+              } else if (control.type === "prompt" && control.message) {
+                pi.sendUserMessage(control.message, { deliverAs: control.delivery ?? "steer" });
+                await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "applied", detail: `${control.delivery ?? "steer"} queued` });
+              } else {
+                await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "rejected", detail: `unsupported control type: ${control.type}` });
+              }
+            } catch (error) {
+              await acknowledgeControl(runtimeDir, ownWorkerId, { id: control.id, outcome: "rejected", detail: error instanceof Error ? error.message : String(error) });
             }
           }
-        })();
+          if (read.malformed > 0) {
+            await acknowledgeControl(runtimeDir, ownWorkerId, { id: `malformed-${read.nextOffset}`, outcome: "rejected", detail: `${read.malformed} malformed control line(s) skipped` });
+          }
+          if (read.entries.length > 0 || read.malformed > 0 || read.clamped) {
+            controlsOffset = read.nextOffset;
+            await writeControlOffset(runtimeDir, ownWorkerId, read.nextOffset);
+          }
+        })().catch(() => void 0).finally(() => {
+          polling = false;
+        });
       }, CONTROL_POLL_MS);
     }
     await refreshToolAccess(ctx);
@@ -5040,7 +5101,7 @@ nextCursor: ${result.nextCursor}`, result);
     description: "Send an instruction to any live worker, including a nested worker. 'steer' is delivered after its current tool batch; 'followUp' waits until it settles.",
     parameters: SteerParams,
     async execute(_id, params) {
-      await sendControl(runtimeDir, params.workerId, { type: "prompt", message: params.message, delivery: params.delivery ?? "steer" });
+      await appendControl(runtimeDir, params.workerId, { type: "prompt", message: params.message, delivery: params.delivery ?? "steer" });
       return textResult(`Queued ${params.delivery ?? "steer"} instruction for worker ${params.workerId}.`, { workerId: params.workerId });
     }
   });
@@ -5073,7 +5134,7 @@ nextCursor: ${nextCursor}`, "info");
       }
       if (action === "steer") {
         if (!first || rest.length === 0) throw new Error("Usage: /workers steer <worker-id> <message>");
-        await sendControl(runtimeDir, first, { type: "prompt", message: rest.join(" "), delivery: "steer" });
+        await appendControl(runtimeDir, first, { type: "prompt", message: rest.join(" "), delivery: "steer" });
         ctx.ui.notify(`Steering message queued for ${first}.`, "info");
         return;
       }
@@ -5096,11 +5157,18 @@ ${summarize(worker)}` : "Worker launch failed before a status record was availab
 }
 export {
   abortWorker,
+  acknowledgeControl,
+  appendControl,
+  controlFileFor,
   workersExtension as default,
+  offsetFileFor,
+  readAppliedControls,
+  readControlOffset,
   readRecord,
   readWorkerEvents,
   sessionFileFor,
   startWorkerProcess,
   workerInvocationArgs,
+  writeControlOffset,
   writeRecord
 };
