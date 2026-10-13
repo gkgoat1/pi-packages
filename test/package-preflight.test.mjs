@@ -29,6 +29,24 @@ test("host pi packages are peers, never runtime dependencies", async () => {
 	assert.match(packageJson.dependencies?.["@earendil-works/gondolin"] ?? "", /^\^/);
 });
 
+test("the tarball is an allowlist: no tests, fixtures, or process docs", () => {
+	const packed = packDryRun();
+	const files = packed.files.map((file) => file.path);
+	const forbidden = files.filter((file) =>
+		/^(test|fixtures)\//.test(file)
+		|| /^docs\/(task-briefs|summaries)\//.test(file)
+		|| /(^|\/)english-enforcer-plan\.md$/.test(file)
+		|| /(^|\/)tool-output-limit-plan\.md$/.test(file)
+		|| /(^|\/)pi-workers-dashboard-publish-plan\.md$/.test(file)
+		|| /\.test\.ts$/.test(file),
+	);
+	assert.deepEqual(forbidden, [], `forbidden files in the tarball: ${forbidden.join(", ")}`);
+	for (const required of ["LICENSE", "CHANGELOG.md", "docs/mcp-migration.md", "examples/package-settings.json.example"]) {
+		assert.ok(files.includes(required), `tarball must include ${required}`);
+	}
+	assert.ok(files.some((file) => file.startsWith("extensions/workers/index.ts")), "sources ship for review");
+});
+
 test("the tarball contains every manifest bundle and no secret-shaped files", () => {
 	const packed = packDryRun();
 	const files = packed.files.map((file) => file.path);

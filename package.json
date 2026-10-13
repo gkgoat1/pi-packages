@@ -26,6 +26,18 @@
   "publishConfig": {
     "access": "public"
   },
+  "files": [
+    "dist/",
+    "extensions/",
+    "examples/",
+    "docs/mcp-migration.md",
+    "docs/deferred-migrations.md",
+    "!**/*.test.ts",
+    "!**/test/**",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
