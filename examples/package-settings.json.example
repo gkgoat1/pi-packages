@@ -1,10 +1,10 @@
 # Package activation examples
 
-This package's extensions are runtime-disabled by default. Use `pi config` to select extensions interactively. For a deterministic settings-file activation, list the extension directory directly in Pi's global (`~/.pi/agent/settings.json`) or trusted project (`.pi/settings.json`) `extensions` array.
+This package (`@gkgo/pi-packages`) is runtime-disabled by default. Use `pi config` to select extensions interactively. For a deterministic settings-file activation, list the extension directory directly in Pi's global (`~/.pi/agent/settings.json`) or trusted project (`.pi/settings.json`) `extensions` array.
 
 ## Enable one extension (then opt it in at runtime)
 
-Replace `/path/to/pi-packages` with the installed package directory. For npm and git packages, this is the installed package directory shown by `pi list`/`pi config`, not the source specifier.
+Replace `/path/to/pi-packages` with the installed package directory. For npm and git packages, this is the installed `@gkgo/pi-packages` directory shown by `pi list`/`pi config`, not the source specifier.
 
 ```json
 {

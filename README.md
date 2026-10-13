@@ -11,9 +11,11 @@ A single installable Pi package that bundles:
 ## Install
 
 ```bash
-pi install /path/to/pi-packages
+pi install npm:@gkgo/pi-packages
 # or, for one project
-pi install -l /path/to/pi-packages
+pi install -l npm:@gkgo/pi-packages
+# or, from a local checkout (development)
+pi install /path/to/pi-packages
 ```
 
 A package install executes extension code with your user permissions. The package deliberately ships with every extension **disabled by default**; opt in to each extension below only where you need it. Review MCP server commands and project configuration before enabling them.
