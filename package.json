@@ -1,11 +1,10 @@
 {
-  "name": "pi-packages",
-  "version": "0.1.0",
-  "description": "Pi extensions for file guards, routed workers, configurable MCP clients, thinking compression, a Gondolin micro-VM sandbox, and sandboxed radare2 binary analysis",
+  "name": "@gkgo/pi-packages",
+  "version": "0.2.0",
+  "description": "Pi extensions for file guards, routed resumable workers with a TUI dashboard, thinking compression, a Gondolin micro-VM sandbox, sandboxed radare2 binary analysis, and configurable tool-output limits",
   "keywords": [
     "pi-package",
     "pi",
-    "mcp",
     "workers",
     "file-guard",
     "thinking-compression",
@@ -18,6 +17,15 @@
     "tool-output"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gkgoat1/pi-packages.git"
+  },
+  "homepage": "https://github.com/gkgoat1/pi-packages",
+  "bugs": "https://github.com/gkgoat1/pi-packages/issues",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
