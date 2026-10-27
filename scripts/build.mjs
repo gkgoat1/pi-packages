@@ -81,6 +81,11 @@ for (const name of await readdir(extensionsDir)) {
 	if (existsSync(durableEntry)) entryPoints.push(durableEntry);
 }
 
+// The env relay is a durable-only library (no pi-coding-agent extension):
+// env-relay/index.ts → dist/env-relay/index.js, env-relay/node.ts → dist/env-relay/node.js.
+const envRelayDir = join(root, "env-relay");
+const envRelayEntries = ["index.ts", "node.ts"].map((entry) => join(envRelayDir, entry)).filter(existsSync);
+
 if (entryPoints.length === 0) {
 	console.error("No extension entry points found under extensions/*");
 	process.exit(1);
@@ -121,6 +126,30 @@ console.log("\nbundled extensions:");
 for (const [out, info] of entries) {
 	const rel = out.replace(/^(.*?\/dist\/)/, "dist/");
 	console.log(`  ${rel}  ${Math.round(info.bytes / 1024)}KB`);
+}
+
+if (envRelayEntries.length > 0) {
+	// The relay client runs in Workers/browsers too, so its bundle must not
+	// capture Node builtins; the node.ts entry may.
+	const relayResult = await esbuild.build({
+		entryPoints: envRelayEntries,
+		bundle: true,
+		format: "esm",
+		platform: "neutral",
+		target: "es2022",
+		outbase: envRelayDir,
+		outdir: join(outDir, "env-relay"),
+		external,
+		sourcemap: false,
+		sourcesContent: false,
+		logLevel: "info",
+		metafile: true,
+	});
+	console.log("\nbundled env relay:");
+	for (const [out, info] of Object.entries(relayResult.metafile.outputs).sort((a, b) => a[0].localeCompare(b[0]))) {
+		const rel = out.replace(/^(.*?\/dist\/)/, "dist/");
+		console.log(`  ${rel}  ${Math.round(info.bytes / 1024)}KB`);
+	}
 }
 
 /**
