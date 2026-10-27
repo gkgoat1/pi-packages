@@ -1,4 +1,4 @@
-import type { ModelRef, ThinkingCompressionConfig } from "./config.ts";
+import type { ModelRef, ThinkingCompressionConfig } from "./config-core.ts";
 
 export type Candidate = { index: number; thinking: string; signed?: boolean; encrypted?: boolean; replayRequired?: boolean };
 

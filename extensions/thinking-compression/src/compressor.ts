@@ -1,10 +1,11 @@
 import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ThinkingCompressionConfig } from "./config.ts";
+import { COMPRESSOR_INSTRUCTIONS } from "./config-core.ts";
+import type { ThinkingCompressionConfig } from "./config-core.ts";
 
-const INSTRUCTIONS = "Return only JSON: {\"thinking\":\"concise continuation memo\"}. Preserve decisions, constraints, uncertainty, and facts. Do not answer the user, invoke tools, provide chain-of-thought, or include credentials.";
+const INSTRUCTIONS = COMPRESSOR_INSTRUCTIONS;
 
-function visibleText(message: any): string | undefined {
+export function visibleText(message: any): string | undefined {
 	if (!Array.isArray(message?.content)) return undefined;
 	const text = message.content.filter((block: any) => block?.type === "text" && typeof block.text === "string").map((block: any) => block.text).join("");
 	return text || undefined;

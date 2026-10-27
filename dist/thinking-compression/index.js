@@ -4,12 +4,15 @@ import { createRequire as __createRequire } from 'node:module';const require = _
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-var DISABLED = {
+
+// extensions/thinking-compression/src/config-core.ts
+var DISABLED_CONFIG = {
   enabled: false,
   sources: [],
   minimumThinkingTokens: 800,
   minimumSavingsRatio: 0.35
 };
+var COMPRESSOR_INSTRUCTIONS = 'Return only JSON: {"thinking":"concise continuation memo"}. Preserve decisions, constraints, uncertainty, and facts. Do not answer the user, invoke tools, provide chain-of-thought, or include credentials.';
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : void 0;
 }
@@ -19,7 +22,7 @@ function modelRef(value) {
 }
 function parseConfig(value) {
   const root = object(value);
-  if (!root || root.enabled !== true) return DISABLED;
+  if (!root || root.enabled !== true) return DISABLED_CONFIG;
   const sources = Array.isArray(root.sources) ? root.sources.map(modelRef) : [];
   if (sources.length === 0 || sources.some((source) => !source)) throw new Error("sources must be a non-empty provider/model allowlist");
   const compressorBase = modelRef(root.compressor);
@@ -39,19 +42,21 @@ function parseConfig(value) {
   if (typeof minimumSavingsRatio !== "number" || minimumSavingsRatio < 0 || minimumSavingsRatio >= 1) throw new Error("minimumSavingsRatio must be between 0 and 1");
   return { enabled: true, sources: routes, compressor: { ...compressorBase, maxOutputTokens, timeoutMs }, minimumThinkingTokens, minimumSavingsRatio };
 }
+
+// extensions/thinking-compression/src/config.ts
 function loadConfig(ctx) {
-  if (!ctx.isProjectTrusted()) return { config: DISABLED };
+  if (!ctx.isProjectTrusted()) return { config: DISABLED_CONFIG };
   const path = join(ctx.cwd, CONFIG_DIR_NAME, "thinking-compression.json");
-  if (!existsSync(path)) return { config: DISABLED };
+  if (!existsSync(path)) return { config: DISABLED_CONFIG };
   try {
     return { config: parseConfig(JSON.parse(readFileSync(path, "utf8"))) };
   } catch (error) {
-    return { config: DISABLED, error: error instanceof Error ? error.message : String(error) };
+    return { config: DISABLED_CONFIG, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 // extensions/thinking-compression/src/compressor.ts
-var INSTRUCTIONS = 'Return only JSON: {"thinking":"concise continuation memo"}. Preserve decisions, constraints, uncertainty, and facts. Do not answer the user, invoke tools, provide chain-of-thought, or include credentials.';
+var INSTRUCTIONS = COMPRESSOR_INSTRUCTIONS;
 function visibleText(message) {
   if (!Array.isArray(message?.content)) return void 0;
   const text = message.content.filter((block) => block?.type === "text" && typeof block.text === "string").map((block) => block.text).join("");

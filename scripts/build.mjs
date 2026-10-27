@@ -34,6 +34,12 @@ const external = [
 	"@earendil-works/pi-agent-core",
 	"@earendil-works/pi-tui",
 	"@earendil-works/gondolin",
+	// Durable entrypoints: resolved by the durable host, never bundled.
+	"@earendil-works/pi-durable",
+	"@earendil-works/pi-durable/*",
+	"@earendil-works/chord",
+	"@earendil-works/chord/*",
+	"@earendil-works/pi-telemetry",
 	// Node builtins (bare + node: forms)
 	"assert",
 	"child_process",
@@ -69,6 +75,10 @@ const entryPoints = [];
 for (const name of await readdir(extensionsDir)) {
 	const entry = join(extensionsDir, name, "index.ts");
 	if (existsSync(entry)) entryPoints.push(entry);
+	// Optional pi-durable entrypoint: dist/<name>/durable.js, a library module
+	// (not a pi-coding-agent extension) for durable Harness registries.
+	const durableEntry = join(extensionsDir, name, "durable.ts");
+	if (existsSync(durableEntry)) entryPoints.push(durableEntry);
 }
 
 if (entryPoints.length === 0) {

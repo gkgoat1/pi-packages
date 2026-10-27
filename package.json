@@ -58,10 +58,26 @@
     "typescript": "^5.7.3"
   },
   "peerDependencies": {
+    "@earendil-works/chord": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-durable": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/chord": {
+      "optional": true
+    },
+    "@earendil-works/pi-durable": {
+      "optional": true
+    }
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    "./file-guard/durable": "./dist/file-guard/durable.js",
+    "./thinking-compression/durable": "./dist/thinking-compression/durable.js",
+    "./tool-output-limit/durable": "./dist/tool-output-limit/durable.js"
   },
   "pi": {
     "extensions": [

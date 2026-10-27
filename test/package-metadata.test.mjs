@@ -13,7 +13,7 @@ async function packageJson() {
 test("the package is the scoped @gkgo/pi-packages release", async () => {
 	const pkg = await packageJson();
 	assert.equal(pkg.name, "@gkgo/pi-packages");
-	assert.equal(pkg.version, "0.2.0");
+	assert.match(pkg.version, /^\d+\.\d+\.\d+$/, "semver release version");
 });
 
 test("publish metadata is explicit", async () => {
@@ -36,5 +36,6 @@ test("LICENSE and CHANGELOG.md exist", async () => {
 	assert.match(license, /MIT License/);
 	assert.match(license, /gkgoat1/);
 	assert.ok(existsSync(resolve(root, "CHANGELOG.md")), "CHANGELOG.md present");
-	assert.match(await readFile(resolve(root, "CHANGELOG.md"), "utf8"), /0\.2\.0/);
+	const pkg = await packageJson();
+	assert.match(await readFile(resolve(root, "CHANGELOG.md"), "utf8"), new RegExp(`## ${pkg.version.replace(/\./g, "\\.")}`), "CHANGELOG documents the current version");
 });

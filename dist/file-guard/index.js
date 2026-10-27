@@ -421,37 +421,8 @@ function getBashPaths(command) {
 import * as fs2 from "node:fs";
 import * as os2 from "node:os";
 import * as path2 from "node:path";
-function expandHome(input) {
-  if (input === "~" || input.startsWith("~/")) {
-    return path2.join(os2.homedir(), input.slice(1));
-  }
-  return input;
-}
-function normalizePath(input, cwd) {
-  let p = expandHome(input);
-  if (!path2.isAbsolute(p)) {
-    p = path2.resolve(cwd, p);
-  }
-  try {
-    return fs2.realpathSync(p);
-  } catch {
-    return path2.resolve(p);
-  }
-}
-function shortenPath(input, cwd) {
-  const home = os2.homedir();
-  if (path2.isAbsolute(input) && pathWithin(cwd, input)) {
-    return path2.relative(cwd, input).replace(/\\/g, "/") || ".";
-  }
-  if (input.startsWith(home)) {
-    return `~${input.slice(home.length)}`;
-  }
-  return input.replace(/\\/g, "/");
-}
-function pathWithin(parent, child) {
-  const rel = path2.relative(parent, child);
-  return rel !== "" && !rel.startsWith("..") && !path2.isAbsolute(rel);
-}
+
+// extensions/file-guard/src/paths-pure.ts
 function globToRegex(pattern) {
   let regex = "";
   let i = 0;
@@ -489,6 +460,39 @@ function globMatch(pattern, target) {
   const dirPrefixRegex = globToRegex(asDir + "**");
   if (dirPrefixRegex.test(normalizedTarget)) return true;
   return false;
+}
+
+// extensions/file-guard/src/paths.ts
+function expandHome(input) {
+  if (input === "~" || input.startsWith("~/")) {
+    return path2.join(os2.homedir(), input.slice(1));
+  }
+  return input;
+}
+function normalizePath(input, cwd) {
+  let p = expandHome(input);
+  if (!path2.isAbsolute(p)) {
+    p = path2.resolve(cwd, p);
+  }
+  try {
+    return fs2.realpathSync(p);
+  } catch {
+    return path2.resolve(p);
+  }
+}
+function shortenPath(input, cwd) {
+  const home = os2.homedir();
+  if (path2.isAbsolute(input) && pathWithin(cwd, input)) {
+    return path2.relative(cwd, input).replace(/\\/g, "/") || ".";
+  }
+  if (input.startsWith(home)) {
+    return `~${input.slice(home.length)}`;
+  }
+  return input.replace(/\\/g, "/");
+}
+function pathWithin(parent, child) {
+  const rel = path2.relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !path2.isAbsolute(rel);
 }
 
 // extensions/file-guard/src/context.ts
@@ -984,6 +988,35 @@ var ContextEnricher = class {
 // extensions/file-guard/src/guard.ts
 import { Text as Text2 } from "@earendil-works/pi-tui";
 
+// extensions/file-guard/src/extract-paths.ts
+function extractToolPaths(toolName, params, cwd) {
+  const input = params ?? {};
+  if (toolName === "read" || toolName === "write" || toolName === "edit" || toolName === "grep" || toolName === "find" || toolName === "ls") {
+    const rawPath = input.path;
+    const paths2 = typeof rawPath === "string" ? [rawPath] : Array.isArray(rawPath) ? rawPath : [];
+    if (paths2.length > 0) return { paths: paths2, reason: `${toolName} tool` };
+  }
+  if (toolName === "bash") {
+    const command = String(input.command ?? "");
+    const analysis = getBashPaths(command);
+    if (!analysis.shouldPrompt && analysis.paths.length === 0) return void 0;
+    return { paths: analysis.paths, reason: analysis.reason };
+  }
+  const paths = [];
+  function collect(value) {
+    if (typeof value === "string") {
+      if (looksLikePath(value)) paths.push(value);
+    } else if (Array.isArray(value)) {
+      value.forEach(collect);
+    } else if (value && typeof value === "object") {
+      Object.values(value).forEach(collect);
+    }
+  }
+  collect(input);
+  if (paths.length > 0) return { paths: [...new Set(paths)], reason: `${toolName} tool references paths` };
+  return void 0;
+}
+
 // extensions/file-guard/src/results.ts
 function resultToText(result) {
   return result.content.map((block) => {
@@ -1153,33 +1186,6 @@ function registerViewRenderer(pi) {
 }
 
 // extensions/file-guard/src/guard.ts
-function extractToolPaths(toolName, params, cwd) {
-  const input = params ?? {};
-  if (toolName === "read" || toolName === "write" || toolName === "edit" || toolName === "grep" || toolName === "find" || toolName === "ls") {
-    const rawPath = input.path;
-    const paths2 = typeof rawPath === "string" ? [rawPath] : Array.isArray(rawPath) ? rawPath : [];
-    if (paths2.length > 0) return { paths: paths2, reason: `${toolName} tool` };
-  }
-  if (toolName === "bash") {
-    const command = String(input.command ?? "");
-    const analysis = getBashPaths(command);
-    if (!analysis.shouldPrompt && analysis.paths.length === 0) return void 0;
-    return { paths: analysis.paths, reason: analysis.reason };
-  }
-  const paths = [];
-  function collect(value) {
-    if (typeof value === "string") {
-      if (looksLikePath(value)) paths.push(value);
-    } else if (Array.isArray(value)) {
-      value.forEach(collect);
-    } else if (value && typeof value === "object") {
-      Object.values(value).forEach(collect);
-    }
-  }
-  collect(input);
-  if (paths.length > 0) return { paths: [...new Set(paths)], reason: `${toolName} tool references paths` };
-  return void 0;
-}
 async function handleGuardedTool(pi, allowedSet, promptQueue, viewLogger, enricher, config, toolName, params, toolCallId, executeAllowed, ctx) {
   const guardInfo = extractToolPaths(toolName, params, ctx.cwd);
   const context = extractToolContext(toolName, params, ctx.cwd);
