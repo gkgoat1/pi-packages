@@ -79,7 +79,8 @@
     "./gondolin/durable": "./dist/gondolin/durable.js",
     "./radare2/durable": "./dist/radare2/durable.js",
     "./thinking-compression/durable": "./dist/thinking-compression/durable.js",
-    "./tool-output-limit/durable": "./dist/tool-output-limit/durable.js"
+    "./tool-output-limit/durable": "./dist/tool-output-limit/durable.js",
+    "./workers/durable": "./dist/workers/durable.js"
   },
   "pi": {
     "extensions": [
