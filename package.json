@@ -1,6 +1,6 @@
 {
   "name": "@gkgo/pi-packages",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi extensions for file guards, routed resumable workers with a TUI dashboard, thinking compression, a Gondolin micro-VM sandbox, sandboxed radare2 binary analysis, and configurable tool-output limits",
   "keywords": [
     "pi-package",

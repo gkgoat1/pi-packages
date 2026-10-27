@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.0 — 2026-10-27
+
+pi-durable support across the package, plus the new durable-only env relay.
+
+- **Durable entrypoints** for every extension, exported as library subpaths
+  for pi-durable `Harness` registries (not Pi extensions; all opt-in):
+  - `file-guard/durable`: `ToolTask` guard hooks with fail-closed blocking and
+    a host `approve` hook; runtime-agnostic; view mode via `onView` sink.
+  - `workers/durable`: native redesign — workers as durable conversations
+    owned by background anchor tasks, background reporter tasks with
+    requestId idempotency, restart-safe; same strict caller-model routing
+    policy (maxDepth/maxWorkers/maxPerLineage).
+  - `thinking-compression/durable`: `beforeRequest` rewriting of compressible
+    thinking blocks via the harness's own `Models` (durable entries are
+    immutable), with a process-lifetime content-hash cache.
+  - `gondolin/durable`: `GondolinExecutionEnv` — a full durable
+    `ExecutionEnv` over a live Gondolin VM — plus the sandbox prompt section.
+  - `radare2/durable`: one-shot `r2_*` tools through the conversation's
+    environment (`api.env`), so analysis runs local, in-VM, or relayed.
+  - `tool-output-limit/durable`: `wrapTool` overrides of durable bash/read
+    output limits.
+- **Env Relay** (`env-relay`, `env-relay/node` subpaths): durable-only
+  `ExecutionEnv` relay — `RelayedExecutionEnv` (Workers-safe client),
+  `serveEnvRelay` (dev-box server with token auth, root jail, read-only
+  mode), `FallbackExecutionEnv` (circuit breaker with half-open probing and
+  namespace-honest id switching), WebSocket and in-memory transports. A
+  Cloudflare Worker + Durable Object host example lives in
+  `examples/env-relay-worker/`.
+
 ## 0.3.0 — 2026-10-26
 
 - Upgraded the host packages to Pi **1.4.0** (`pi-coding-agent`, `pi-ai`,
