@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 — 2026-10-26
+
+- Upgraded the host packages to Pi **1.4.0** (`pi-coding-agent`, `pi-ai`,
+  `pi-tui`); they are now pinned `^1.4.0` devDependencies so builds are
+  reproducible, and remain `*` peers for installs.
+- Verified the Pi 1.2.0 `before_agent_start` event union (`messageType`
+  `"user" | "custom"`) against File Guard and Gondolin; a regression test
+  covers both variants.
+- Completed the MCP purge: removed `docs/mcp-migration.md`,
+  `examples/mcp.json.example`, `test/mcp-builtin.test.mjs`, and
+  `fixtures/fake-mcp-server.mjs`. MCP is Pi's built-in feature; the purge-guard
+  tests remain so the bundled client can never return.
+
 ## 0.2.0 — 2026-10-12
 
 Breaking release. See `docs/mcp-migration.md` for the MCP migration.

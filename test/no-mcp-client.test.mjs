@@ -8,11 +8,9 @@ const root = resolve(import.meta.dirname, "..");
 
 /** Migration notes and process documents may name the removed extension; shipped resources may not point at it. */
 const EXEMPT = new Set([
-	"docs/mcp-migration.md",
 	"docs/pi-workers-dashboard-publish-plan.md",
 	"test/no-mcp-client.test.mjs",
 	"test/mcp-purge.test.mjs",
-	"test/mcp-builtin.test.mjs",
 ]);
 const EXEMPT_DIRS = new Set(["docs/task-briefs", "docs/summaries"]);
 

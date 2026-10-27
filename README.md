@@ -22,14 +22,13 @@ A package install executes extension code with your user permissions. The packag
 
 ## Enable an extension
 
-Each extension is also runtime-disabled by default, so enabling it with `pi config` or a direct extension path remains safe until its own explicit opt-in is configured. The extension-specific opt-ins below provide the final safeguard for File Guard, Workers, and MCP server startup.
+Each extension is also runtime-disabled by default, so enabling it with `pi config` or a direct extension path remains safe until its own explicit opt-in is configured. The extension-specific opt-ins below provide the final safeguard for File Guard and Workers.
 
 ## Configuration
 
 - [`examples/package-settings.json.example`](examples/package-settings.json.example) shows direct extension-path entries for activating bundled extensions in Pi settings.
 - File Guard: set `"enabled": true` (or `"guardEnabled": true`) in its config, or `PI_FILE_GUARD_ENABLED=true`; see [`extensions/file-guard/README.md`](extensions/file-guard/README.md) and [`examples/file-guard.config.json`](examples/file-guard.config.json).
 - Workers: set `"enabled": true` in the target project's `.pi/workers.json`; start from [`examples/workers.json.example`](examples/workers.json.example) and see [`extensions/workers/README.md`](extensions/workers/README.md).
-- MCP servers: use Pi's built-in MCP support (`~/.pi/agent/mcp.json` or `.pi/mcp.json` in trusted projects; see [`examples/mcp.json.example`](examples/mcp.json.example)). The bundled mcp-client extension was removed — [`docs/mcp-migration.md`](docs/mcp-migration.md) maps the old configuration.
 - Gondolin Sandbox: set `"enabled": true` in its config or `PI_GONDOLIN_ENABLED=true` (QEMU required; `accel` defaults to `tcg` for nested VMs); see [`extensions/gondolin/README.md`](extensions/gondolin/README.md) and [`examples/gondolin.json.example`](examples/gondolin.json.example).
 - Tool Output Limit: set `"enabled": true` in `~/.pi/agent/tool-output-limit.json` or a trusted `.pi/tool-output-limit.json`; see [`extensions/tool-output-limit/README.md`](extensions/tool-output-limit/README.md).
 

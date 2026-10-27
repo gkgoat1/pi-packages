@@ -1,6 +1,6 @@
 {
   "name": "@gkgo/pi-packages",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extensions for file guards, routed resumable workers with a TUI dashboard, thinking compression, a Gondolin micro-VM sandbox, sandboxed radare2 binary analysis, and configurable tool-output limits",
   "keywords": [
     "pi-package",
@@ -30,7 +30,6 @@
     "dist/",
     "extensions/",
     "examples/",
-    "docs/mcp-migration.md",
     "docs/deferred-migrations.md",
     "!**/*.test.ts",
     "!**/test/**",
@@ -49,6 +48,11 @@
     "test:pi": "npm run build && node --test test/workers-bundle.test.mjs test/gondolin-bundle.test.mjs test/radare2-bundle.test.mjs"
   },
   "devDependencies": {
+    "@earendil-works/chord": "^1.4.0",
+    "@earendil-works/pi-ai": "^1.4.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-durable": "^1.4.0",
+    "@earendil-works/pi-tui": "^1.4.0",
     "esbuild": "^0.28.0",
     "tsx": "^4.19.4",
     "typescript": "^5.7.3"

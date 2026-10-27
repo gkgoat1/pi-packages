@@ -144,8 +144,8 @@ interface GondolinShared {
   matching discovered secrets are stubbed so real keys stay host-side (the
   HTTP proxy inflates them back on egress). This is how the
   [radare2](../radare2) extension runs binary analysis in-VM. The older
-  in-VM MCP server path was retired with the bundled mcp-client extension
-  (see `docs/mcp-migration.md`).
+  in-VM MCP server path was retired with the bundled mcp-client extension;
+  MCP is Pi's built-in feature now (`mcp.json`, `pi mcp`, `/mcp`).
 - **`refreshTrust`** re-reads this extension's config with the session's
   project-trust decision, so earlier-loaded extensions see the correct
   enabled state.

@@ -26,8 +26,8 @@
  * bundle: File Guard enforces its policy as VM-filesystem interception, and
  * radare2 runs analysis inside the VM. Both integrations activate only when
  * this extension and the consumer are enabled. The older in-VM MCP server
- * path was retired with the bundled mcp-client extension; see
- * docs/mcp-migration.md.
+ * path was retired with the bundled mcp-client extension; MCP is Pi's
+ * built-in feature now (`mcp.json`, `pi mcp`, `/mcp`).
  */
 
 import path from "node:path";

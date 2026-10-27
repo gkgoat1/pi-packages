@@ -38,10 +38,11 @@ test("the tarball is an allowlist: no tests, fixtures, or process docs", () => {
 		|| /(^|\/)english-enforcer-plan\.md$/.test(file)
 		|| /(^|\/)tool-output-limit-plan\.md$/.test(file)
 		|| /(^|\/)pi-workers-dashboard-publish-plan\.md$/.test(file)
+		|| /(^|\/)pi-1\.4-durable-plan\.md$/.test(file)
 		|| /\.test\.ts$/.test(file),
 	);
 	assert.deepEqual(forbidden, [], `forbidden files in the tarball: ${forbidden.join(", ")}`);
-	for (const required of ["LICENSE", "CHANGELOG.md", "docs/mcp-migration.md", "examples/package-settings.json.example"]) {
+	for (const required of ["LICENSE", "CHANGELOG.md", "docs/deferred-migrations.md", "examples/package-settings.json.example"]) {
 		assert.ok(files.includes(required), `tarball must include ${required}`);
 	}
 	assert.ok(files.some((file) => file.startsWith("extensions/workers/index.ts")), "sources ship for review");
